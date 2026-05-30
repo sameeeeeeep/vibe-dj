@@ -1,0 +1,7 @@
+numpy>=1.26
+scipy>=1.11
+sounddevice>=0.4.6
+# opencv is optional: the crowd sensor falls back to a simulator if it's missing.
+opencv-python>=4.9
+# yt-dlp is optional: only needed for the --youtube source.
+yt-dlp>=2024.0

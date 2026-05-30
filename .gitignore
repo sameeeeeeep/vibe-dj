@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# DJ runtime artifacts
+yt_cache/
+yt_test/
+yt_rock/
+yt_buf/
+yt_main/
+demo_tracks/
+*.dj_cache.json
+.dj_cache.json
+
+# Audio/scratch
+*.wav
+*.mp3
+*.m4a
+*.webm
+*.opus
+*.flac
+
+# OS
+.DS_Store
