@@ -23,6 +23,18 @@ MAX_BPM = 180.0
 PRIOR_CENTER_BPM = 120.0
 PRIOR_WIDTH = 0.9  # in octaves
 
+# Phrase grid: 4/4 bars grouped into phrases. Mix points snap to this grid so
+# blends land on musical "sentence" boundaries, not mid-phrase.
+BEATS_PER_BAR = 4
+PHRASE_BARS = 8
+
+# Section detection (intro / outro) from a smoothed loudness envelope.
+SECTION_SMOOTH_SEC = 1.5   # smooth past beat-level flicker
+LOUD_FRAC = 0.45           # fraction of peak energy that counts as "full"
+SUSTAIN_SEC = 4.0          # how long energy must hold to call the intro over
+INTRO_MAX_FRAC = 0.4       # ignore "intros" longer than this share of the track
+OUTRO_MIN_FRAC = 0.5       # an outro must sit in the back half to be real
+
 
 @dataclass
 class Analysis:
@@ -34,12 +46,44 @@ class Analysis:
     rms: float
     centroid: float         # mean spectral centroid (Hz) -> brightness
     onset_rate: float       # mean onset-envelope value -> rhythmic density
+    # Structure (0/duration defaults => "no section found", callers fall back).
+    intro_end: float = 0.0      # seconds: where the first full-energy section starts
+    outro_start: float = 0.0    # seconds: where the final wind-down begins
+    phrase_period: float = 0.0  # seconds per phrase (BEATS_PER_BAR * PHRASE_BARS beats)
 
     def beat_times(self, until: float) -> np.ndarray:
         if self.beat_period <= 0:
             return np.array([])
         n = int(max(0, (until - self.beat_offset) / self.beat_period)) + 1
         return self.beat_offset + np.arange(n) * self.beat_period
+
+    def phrase_times(self, until: float) -> np.ndarray:
+        if self.phrase_period <= 0:
+            return np.array([])
+        n = int(max(0, (until - self.beat_offset) / self.phrase_period)) + 1
+        return self.beat_offset + np.arange(n) * self.phrase_period
+
+    def _snap_phrase(self, t: float) -> float:
+        """Nearest phrase boundary to t, clamped within the track."""
+        if self.phrase_period <= 0:
+            return t
+        k = max(0, round((t - self.beat_offset) / self.phrase_period))
+        return float(min(max(0.0, self.beat_offset + k * self.phrase_period), self.duration))
+
+    def mix_in_sec(self) -> float:
+        """Phrase-aligned point to bring this track IN (past its intro). Falls
+        back to the first beat when no structure was detected."""
+        if self.phrase_period <= 0:
+            return self.beat_offset
+        return self._snap_phrase(self.intro_end)
+
+    def mix_out_sec(self) -> float:
+        """Phrase-aligned point to start mixing this track OUT (into its outro).
+        Returns duration when no outro was detected, so the caller mixes at the
+        track's end instead."""
+        if self.phrase_period <= 0 or self.outro_start >= self.duration:
+            return self.duration
+        return self._snap_phrase(self.outro_start)
 
 
 def _onset_envelope(mono: np.ndarray, sr: int):
@@ -90,6 +134,49 @@ def _estimate_phase(oenv: np.ndarray, fps: float, bpm: float) -> float:
     return best_phase / fps             # seconds
 
 
+def _detect_sections(S: np.ndarray, fps: float, duration: float) -> tuple[float, float]:
+    """Coarse intro/outro boundaries from a smoothed loudness envelope.
+
+    Returns (intro_end, outro_start) in seconds. intro_end is 0 and outro_start
+    is the duration when no clear section is found, so callers fall back to
+    start-of-track / end-of-track behaviour.
+    """
+    if S.size == 0 or fps <= 0:
+        return 0.0, duration
+    e = (S.astype(np.float64) ** 2).sum(axis=0)
+    win = max(1, int(round(SECTION_SMOOTH_SEC * fps)))
+    if win > 1:
+        e = np.convolve(e, np.ones(win) / win, mode="same")
+    n = e.size
+    peak = float(np.percentile(e, 90))
+    if n < 4 or peak <= 0:
+        return 0.0, duration
+    loud = (e / peak) >= LOUD_FRAC
+    if not loud.any():
+        return 0.0, duration
+
+    # intro_end: first frame where the track stays mostly loud for SUSTAIN_SEC.
+    intro_end = 0.0
+    sustain = max(1, int(round(SUSTAIN_SEC * fps)))
+    if n >= sustain:
+        csum = np.concatenate([[0], np.cumsum(loud.astype(np.int64))])
+        intro_frame = 0
+        for i in range(0, n - sustain + 1):
+            if csum[i + sustain] - csum[i] >= 0.8 * sustain:
+                intro_frame = i
+                break
+        intro_end = intro_frame / fps
+        if intro_end > INTRO_MAX_FRAC * duration:
+            intro_end = 0.0
+
+    # outro_start: after the last loud frame the track has wound down for good.
+    outro_start = int(np.flatnonzero(loud)[-1]) / fps
+    if outro_start < OUTRO_MIN_FRAC * duration or outro_start >= duration - 0.5:
+        outro_start = duration
+
+    return float(intro_end), float(outro_start)
+
+
 def analyze(audio: np.ndarray, sr: int = SAMPLE_RATE) -> Analysis:
     mono = to_mono(audio).astype(np.float32)
     duration = mono.size / sr
@@ -113,6 +200,9 @@ def analyze(audio: np.ndarray, sr: int = SAMPLE_RATE) -> Analysis:
     centroid = float((freqs[:, None] * S)[:, nz].sum() / mag[nz].sum()) if nz.any() else 0.0
     onset_rate = float(oenv.mean())
 
+    intro_end, outro_start = _detect_sections(S, fps, duration)
+    phrase_period = (60.0 / bpm) * BEATS_PER_BAR * PHRASE_BARS if bpm > 0 else 0.0
+
     return Analysis(
         bpm=round(bpm, 2),
         beat_offset=beat_offset,
@@ -121,4 +211,7 @@ def analyze(audio: np.ndarray, sr: int = SAMPLE_RATE) -> Analysis:
         rms=rms,
         centroid=centroid,
         onset_rate=onset_rate,
+        intro_end=intro_end,
+        outro_start=outro_start,
+        phrase_period=phrase_period,
     )

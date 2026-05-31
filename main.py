@@ -37,6 +37,8 @@ def main() -> int:
     ap.add_argument("--simulate-crowd", action="store_true", help="fake the crowd signal (no webcam)")
     ap.add_argument("--camera", type=int, default=0, help="webcam index (default 0)")
     ap.add_argument("--dry-run", action="store_true", help="no audio device; just run the loop")
+    ap.add_argument("--dashboard", action="store_true", help="serve the live web dashboard")
+    ap.add_argument("--port", type=int, default=8765, help="dashboard port (default 8765)")
     ap.add_argument("--crossfade", type=float, default=12.0, help="crossfade length, seconds")
     ap.add_argument("--cue-lead", type=float, default=25.0, help="cue the next track this long before the end")
     ap.add_argument("--duration", type=float, default=0.0, help="auto-stop after N seconds (0 = run forever)")
@@ -81,6 +83,12 @@ def main() -> int:
     mixer.start()
     controller.start_set()
 
+    dashboard = None
+    if args.dashboard:
+        from dj.dashboard import Dashboard
+        dashboard = Dashboard(controller, mixer, crowd, library, port=args.port).start()
+        print(f"Dashboard: http://127.0.0.1:{args.port}")
+
     start = time.monotonic()
     try:
         while True:
@@ -96,6 +104,8 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nstopping...")
     finally:
+        if dashboard is not None:
+            dashboard.stop()
         controller.stop()
         crowd.stop()
         mixer.stop()

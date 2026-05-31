@@ -20,6 +20,7 @@ class CrowdSensor:
         self.smoothing = smoothing      # EMA factor for the published energy
         self._energy = 0.5
         self._scale = 1e-6              # adaptive normaliser for raw motion
+        self._jpeg: bytes | None = None  # latest cam frame, JPEG-encoded (camera mode)
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -29,6 +30,12 @@ class CrowdSensor:
     def energy(self) -> float:
         with self._lock:
             return self._energy
+
+    @property
+    def last_jpeg(self) -> bytes | None:
+        """Most recent webcam frame as JPEG bytes, or None (simulated/no cam)."""
+        with self._lock:
+            return self._jpeg
 
     def _publish(self, raw_motion: float) -> None:
         # Adaptive scale: chase peaks quickly, decay slowly to recalibrate.
@@ -68,6 +75,11 @@ class CrowdSensor:
                 motion = float(np.abs(gray - prev).mean())
                 self._publish(motion)
             prev = gray
+            ok_enc, buf = cv2.imencode(".jpg", small)
+            if ok_enc:
+                jpeg = buf.tobytes()
+                with self._lock:
+                    self._jpeg = jpeg
             time.sleep(0.03)
         cap.release()
 

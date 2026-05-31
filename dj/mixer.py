@@ -10,9 +10,16 @@ import numpy as np
 from . import CHANNELS, SAMPLE_RATE
 from .analysis import Analysis
 from .deck import Deck
+from .eq import ThreeBandEQ
 
 BLOCK = 1024
 RATE_LIMIT = 0.08  # max +/- varispeed (~8%) so beatmatching doesn't sound chipmunky
+
+# Where in a crossfade the basslines trade. Before the start only the outgoing
+# deck owns the lows; after the end only the incoming deck does — so two
+# basslines never play at once (the classic "bass swap" that keeps blends clean).
+BASS_SWAP_START = 0.45
+BASS_SWAP_END = 0.60
 
 
 class Mixer:
@@ -20,6 +27,11 @@ class Mixer:
         self.decks = {"A": Deck("A"), "B": Deck("B")}
         self.current = "A"
         self.dry_run = dry_run
+
+        # Per-deck 3-band EQ and its (low, mid, high) gains. Unity is transparent;
+        # the bass-swap automation drives these during a crossfade.
+        self.eqs = {"A": ThreeBandEQ(), "B": ThreeBandEQ()}
+        self.bands = {"A": [1.0, 1.0, 1.0], "B": [1.0, 1.0, 1.0]}
 
         self._xf_lock = threading.Lock()
         self._xf_active = False
@@ -45,12 +57,18 @@ class Mixer:
     def idle_name(self) -> str:
         return "B" if self.current == "A" else "A"
 
+    def _reset_eq(self, name: str) -> None:
+        self.eqs[name].reset()
+        self.bands[name] = [1.0, 1.0, 1.0]
+
     def load_idle(self, samples: np.ndarray, analysis: Analysis, title: str) -> None:
         self.idle_deck.load(samples, analysis, title)
+        self._reset_eq(self.idle_name)
 
     def start_first(self, samples: np.ndarray, analysis: Analysis, title: str) -> None:
         d = self.live_deck
         d.load(samples, analysis, title)
+        self._reset_eq(self.current)
         d.pos = max(0.0, analysis.beat_offset * SAMPLE_RATE)
         d.gain = 1.0
         d.playing = True
@@ -59,6 +77,16 @@ class Mixer:
     def is_transitioning(self) -> bool:
         with self._xf_lock:
             return self._xf_active
+
+    def transition_state(self) -> dict:
+        """Snapshot of the crossfade for observers (e.g. the dashboard)."""
+        with self._xf_lock:
+            return {
+                "active": self._xf_active,
+                "progress": min(1.0, self._xf_done / self._xf_total) if self._xf_active else 0.0,
+                "from": self._xf_from if self._xf_active else "",
+                "to": self._xf_to if self._xf_active else "",
+            }
 
     def start_transition(self, duration_sec: float) -> None:
         live = self.live_deck
@@ -70,12 +98,15 @@ class Mixer:
         rate = target_bpm / nxt.analysis.bpm if nxt.analysis.bpm > 0 else 1.0
         nxt.rate = float(np.clip(rate, 1 - RATE_LIMIT, 1 + RATE_LIMIT))
 
-        # Align the incoming track's next beat to the outgoing track's next beat.
+        # Drop the incoming track in at its mix-in cue (past the intro, on a
+        # phrase boundary) and align its next beat to the outgoing track's next
+        # beat. The cue sits on a beat, so adding the sub-beat phase offset keeps
+        # the blend beatmatched.
         src_period = nxt.analysis.beat_period
         from_next = live.seconds_to_next_beat()
         if src_period > 0:
             x = (src_period - (from_next * nxt.rate) % src_period) % src_period
-            nxt.pos = max(0.0, (nxt.analysis.beat_offset + x) * SAMPLE_RATE)
+            nxt.pos = max(0.0, (nxt.analysis.mix_in_sec() + x) * SAMPLE_RATE)
         nxt.gain = 0.0
         nxt.playing = True
 
@@ -96,10 +127,20 @@ class Mixer:
             to = self.decks[self._xf_to]
             frm.gain = float(np.cos(p * np.pi / 2))
             to.gain = float(np.sin(p * np.pi / 2))
+
+            # Bass swap: trade the lows over the swap window so only one bassline
+            # plays at a time. Mids/highs ride the equal-power volume fade above.
+            swap = (p - BASS_SWAP_START) / (BASS_SWAP_END - BASS_SWAP_START)
+            swap = min(1.0, max(0.0, swap))
+            self.bands[self._xf_from] = [1.0 - swap, 1.0, 1.0]
+            self.bands[self._xf_to] = [swap, 1.0, 1.0]
+
             if p >= 1.0:
                 frm.gain = 0.0
                 frm.playing = False
                 to.gain = 1.0
+                self.bands[self._xf_from] = [1.0, 1.0, 1.0]
+                self.bands[self._xf_to] = [1.0, 1.0, 1.0]
                 self.current = self._xf_to
                 self._xf_active = False
 
@@ -107,11 +148,12 @@ class Mixer:
     def mix(self, n: int) -> np.ndarray:
         self._advance_crossfade(n)
         out = np.zeros((n, CHANNELS), dtype=np.float32)
-        for d in self.decks.values():
+        for name, d in self.decks.items():
             g = d.gain
             if g <= 0.0 and not d.playing:
                 continue
-            out += d.read(n) * g
+            lg, mg, hg = self.bands[name]
+            out += self.eqs[name].process(d.read(n), lg, mg, hg) * g
         np.clip(out, -1.0, 1.0, out=out)
         return out
 
