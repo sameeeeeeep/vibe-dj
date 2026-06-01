@@ -10,6 +10,54 @@ next track to match where the room is heading, beatmatches it, and crossfades.
 Repo: https://github.com/sameeeeeeep/vibe-dj (public, MIT)
 
 ## ✅ DONE (recent)
+- **Transition styles (6)** — beyond the single equal-power+bass-swap blend. `dj/mixer.py`
+  `TRANSITIONS = (smooth, bass_swap, filter, cut, echo, brake)`; `start_transition(dur, kind)` +
+  a per-kind dispatch in `_advance_crossfade`. `smooth`=equal-power+bass swap; `bass_swap`=both
+  grooves coexist at volume, basslines trade, outgoing drops late; `filter`=HP-sweep the outgoing
+  / open the incoming (drives the new 3-band `eq_auto` automation that replaced low-only
+  `bass_auto`); `cut`=~35ms downbeat swap; `echo`=feedback-delay throw (`_FeedbackDelay`, one beat,
+  vectorised block-wise so no per-sample loop in the callback) rung out in `mix()`; `brake`=tape-
+  stop (ramp outgoing `rate`→0, incoming held frozen at its cue then slams in). Controller
+  `transition_kind` ("auto" or forced) + `_choose_kind()` picks by energy delta (lift→cut/echo,
+  drop→filter/brake, cruise→smooth/bass_swap/filter) with a rotor so it varies. Dashboard
+  TRANSITION-STYLE picker (`transition_kind` cmd, `renderTx`, live readout). Verified headless
+  (all 6 render finite, complete, swap, no clip, eq_auto resets, brake releases rate) + live.
+- **Drum/beat loop layer ("beats" pad)** — `dj/beats.py` `BeatMachine`: numpy-synth voices
+  (kick/clap/hats/snare/perc, no samples on disk), 16-step pattern, bar sized to the live deck's
+  heard tempo so it's tempo-matched + beat-locked (downbeat lock for free), intensity follows the
+  song vibe (AUTO) or manual. Summed in `mixer.mix()`; controller pushes `set_vibe`; dashboard
+  BEATS panel (toggle / AUTO·MANUAL / VIBE / MIX). Verified headless + live.
+- **Selectable beat styles + AUTO** — `dj/beats.py` now carries 6 named drum patterns
+  `STYLES = (four_floor, house, techno, breakbeat, trap, afro)` (each a `_p_*` builder; steps may
+  be fractional, e.g. 32nd-note trap rolls) plus `style="auto"` where `_auto_style()` maps the
+  song vibe to a fitting groove (afro→house→four_floor→techno; breakbeat/trap are manual-only).
+  Manual pick always wins. `set_style()` / `effective_style()`; `state()` exposes `style` +
+  `style_eff`; render cache rebuilds on style change. Dashboard BEATS **style picker** (7 buttons,
+  `beats_style` cmd; active = chosen, outline = AUTO's current pick). Verified headless + live.
+- **Sound-FX rack (paste a link → triggerable pad)** — `dj/fx.py` `FXRack`: paste any URL yt-dlp
+  understands (public Instagram reel, YouTube, TikTok, direct media) → download to a tempdir →
+  ffmpeg `decode()` → `_trim_oneshot` (skip lead-in silence, cap `FX_MAX_SEC=6s`, normalize, 6ms
+  click-guard fades) → an in-RAM one-shot pad; the source file is deleted right after decode
+  (self-cleaning, disk-tight). Up to `MAX_SLOTS=8` pads, oldest idle evicted at cap; `trigger(idx)`
+  (retrigger chokes the prior hit), master `level`. Summed in `mixer.mix()`. Worker-thread load so
+  the POST returns instantly. Dashboard FX panel (url input + LOAD, pad grid with fire-flash, LVL).
+  Private/login-walled media fails to the log — never prompts for credentials. Verified headless +
+  live (stubbed download).
+- **MIDI melody layer (.mid → synth voices over the track)** — `dj/midi.py`: a tiny Standard MIDI
+  File reader (`parse_midi`, stdlib bytes only, NO mido/pretty_midi) that positions notes in
+  *beats* (tick/PPQ), independent of the file's own tempo, so the layer slaves to the live deck;
+  GM drum channel 9 skipped. `MelodyLayer` synthesises the notes into one beat-locked loop
+  (poly osc: sin + 0.25·2nd + 0.12·3rd harmonic, exp-decay pluck env), tempo-matched the same way
+  the beats layer is; `transpose` ±24 semis just rebuilds the loop. Summed in `mixer.mix()`.
+  Dashboard MELODY panel (.mid discovery dropdown + path load, toggle, SEMI ± transpose, MIX).
+  Verified headless + live.
+- **Headphone cue / second output + custom cue points + master-pin** — monitor feed on a second
+  device (`--cue-device` or dashboard MONITOR panel) reads decks via `read_preview()` on its own
+  playheads (never disturbs the master); CUED/LIVE/MASTER source + AUDITION (renders the real
+  blend to the monitor only). Draggable per-deck mix-in/out markers (`Deck.mix_*_override`,
+  `set_mix_in/out`). `--master-device` pins the room output so making AirPods the default doesn't
+  drag the master onto them. NOTE: macOS only exposes AirPods to CoreAudio once they're actively
+  routed; PortAudio caches devices at process init, so newly-activated devices need a restart.
 - **Web dashboard UI** — `dj/dashboard.py` (stdlib `http.server` + SSE, no new deps). Run with
   `--dashboard` (default `--port 8765`). Deck A/B (now-playing + cued, BPM/energy/playhead),
   crowd-cam thumbnail + energy/target meters, upcoming buffer, crossfader, and controls (skip,
@@ -28,20 +76,29 @@ Repo: https://github.com/sameeeeeeep/vibe-dj (public, MIT)
   live track's outro cue (with the end-of-track trigger kept as fallback). Verified headless.
 
 ## ▶️ NEXT STEPS (pick one)
-1. **In-track EQ kills + dashboard controls** (smallest next win — EQ infra already exists):
-   expose per-deck low/mid/high cut that the DJ (dashboard buttons) and/or the autopilot can
-   fire mid-track, by driving the existing `Mixer.bands`. Add `Controller` methods + `/control`
-   cmds + UI. Bass/mid/high "kill" buttons per deck.
-2. **Filter sweep (LP/HP)** — one moving-cutoff biquad per deck for buildups/transitions; big
-   "live FX" feel, cheap. Add to `dj/eq.py` (or a sibling), drive from `mixer`/dashboard.
-3. **Looping / loop-rolls** — sample-index math on `dj/deck.py` (loop in/out over N beats). Lets
+1. **Audition the new layers + transition styles by ear** on a real set through speakers. Logic +
+   audio are verified headless and the engine runs live clean, but none of these have been
+   critically tuned by listening yet: the 6 transition styles (esp. `echo` tail level/feedback,
+   `brake` halt timing, `filter` sweep shape), the beats pad mix + the 6 drum styles (do they
+   read as house/techno/afro/etc?), the MIDI melody synth tone/level, and FX one-shot loudness.
+   Tune constants in `dj/mixer._advance_crossfade` / `_KIND_SECONDS` / `_FeedbackDelay`,
+   `dj/beats.py` (per-voice levels + the `_p_*` builders), `dj/midi.py` (`_synth_loop` harmonics
+   / envelope / `0.18` vel scale), and `dj/fx.py` (`_trim_oneshot` normalize target).
+2. **Looping / loop-rolls** — sample-index math on `dj/deck.py` (loop in/out over N beats). Lets
    the autopilot *stretch a breakdown* when the room cools — crowd-driven arrangement, not just
    selection. Medium.
+3. **Filter sweep as a standalone live-FX knob** — the `filter` *transition* exists, but a
+   per-deck moving-cutoff sweep the DJ can ride mid-track (buildups) is still open. A real
+   LP/HP biquad in `dj/eq.py` would be crisper than the current EQ-band approximation.
 4. **Real webcam path** — thumbnail plumbing DONE (`CrowdSensor.last_jpeg` + `/frame.jpg`), still
    UNTESTED on hardware: verify `cv2.VideoCapture(0)` opens, tune motion normalization in
    `dj/crowd.py::_camera_loop`. Simulated mode shows a "no camera" placeholder, as expected.
-5. Stretch: hot cues + live re-arrangement; echo/delay FX throw; downbeat detection to sharpen
-   the phrase grid (today it assumes `beat_offset` is a downbeat); keylock time-stretch (hard).
+5. Stretch: hot cues + live re-arrangement; downbeat detection to sharpen the phrase grid (today
+   it assumes `beat_offset` is a downbeat); keylock time-stretch (hard).
+
+DONE already (were on this list): in-track EQ kills (per-deck low/mid/high kill buttons +
+`Mixer.set_eq`/`toggle_kill`), filter sweep (now a `filter` transition style), echo/delay throw
+(now an `echo` transition style).
 
 ## Dev setup
 - **Python 3.13** (NOT 3.14 — DSP wheels missing there). venv at `./.venv`.
@@ -65,12 +122,26 @@ dj/
                    detection (intro_end/outro_start from a smoothed loudness envelope) + a
                    phrase grid → mix_in_sec()/mix_out_sec() phrase-aligned cue points.
   eq.py            ThreeBandEQ: scipy-biquad low/mid/high, bands by subtraction (unity =
-                   transparent), stateful across blocks. Used for bass-swap + (future) kills.
+                   transparent), stateful across blocks. Used for bass-swap, in-track EQ kills,
+                   and the filter-transition sweep (via Mixer.eq_auto).
+  beats.py         BeatMachine: procedural numpy drum-loop layer ("beats" pad), tempo-matched +
+                   beat-locked to the live deck, intensity follows song vibe. 6 selectable styles
+                   (four_floor/house/techno/breakbeat/trap/afro) + AUTO (_auto_style by vibe);
+                   manual pick wins. Summed in mix().
+  midi.py          parse_midi(): minimal Standard MIDI File reader (stdlib bytes, no mido), notes
+                   positioned in beats so the layer slaves to the deck's tempo. MelodyLayer: poly
+                   synth, one beat-locked loop, transpose ±24. Summed in mix().
+  fx.py            FXRack: paste a URL → yt-dlp download → ffmpeg decode → trimmed one-shot pad
+                   (source deleted after decode, self-cleaning). Up to 8 triggerable pads + master
+                   level. Summed in mix().
   library.py       static folder scan + analysis cache (.dj_cache.json) + energy ranking.
                    score_energy() is shared with the pool. release() = no-op (don't delete user files)
   deck.py          one deck: in-RAM samples + fractional playhead + varispeed read (beatmatch)
-  mixer.py         two decks, equal-power beat-aligned crossfade + per-deck 3-band EQ; bass-swap
-                   during transitions; mixes incoming in at its mix-in cue. sounddevice/dummy backend
+  mixer.py         two decks + per-deck 3-band EQ (eq_manual × eq_auto). 6 transition styles
+                   (TRANSITIONS / start_transition(dur,kind) / _advance_crossfade dispatch):
+                   smooth, bass_swap, filter, cut, echo (_FeedbackDelay), brake. Beat-aligned,
+                   mixes incoming in at its mix-in cue. Second monitor output + master-pin.
+                   Drum/melody/fx layers summed on top. sounddevice/dummy backend
   crowd.py         webcam motion-energy → 0..1 (EMA + adaptive scale); simulator fallback
   controller.py    autopilot: read crowd → target_energy (slew-limited) → pick next → transition
   youtube_source.py yt-dlp wrapper: list_entries / download_one / fetch
@@ -106,12 +177,20 @@ while the playlist loops; **web dashboard** (headless + real browser: SSE snapsh
 mutate engine state, transition/beatmatch/buffer all render); **live audio output** (running a
 real Lane 8/Elderbrook YouTube set through speakers); **bass-swap EQ** (headless: lows trade,
 unity transparent, no clipping); **section-aware mixing** (headless: intro/outro detected,
-phrase-snapped cues, controller fires at outro & brings incoming in past its intro).
-Deployed: the live YouTube set on `--dashboard --port 8765` now runs the new bass-swap EQ +
+phrase-snapped cues, controller fires at outro & brings incoming in past its intro);
+**selectable beat styles** (headless: 6 patterns render, AUTO picks afro/house/four_floor/techno
+by vibe, manual override wins; live dashboard switched style→techno); **FX rack** (headless:
+trim/trigger/retrigger, capacity eviction, add_from_url via stubbed download, summed in mix;
+live: bad link rejected to log); **MIDI melody** (headless: SMF parse of a 4-note arpeggio at
+beats 0/1/2/3, beat-locked render, transpose ±, summed in mix; live: `[midi] loaded` clean).
+Deployed: the live YouTube set on `--dashboard --port 8765` runs the bass-swap EQ +
 section-aware mixing code through real speakers (crowd simulated). It comes up clean — buffers
-the playlist, starts on track 1, dashboard serves the new manual-crowd UI, no tracebacks.
-NOT tested: real webcam; EQ bass-swap + section cues *by ear* on a real set (logic verified and
-now running live, but not yet critically auditioned through speakers).
+the playlist, starts on track 1, dashboard serves the manual-crowd UI, no tracebacks.
+NOT tested: real webcam; everything *by ear* on a real set — EQ bass-swap, section cues, the 6
+transition styles, the 6 beat styles, the MIDI melody synth, and FX one-shots are all logic-
+verified (and the engine runs live clean) but not yet critically auditioned through speakers.
+The port-8765 background set still runs the OLD transition-only code — restart it to pick up the
+beat-styles / FX / melody layers (left as-is; it's the user's live set).
 
 ## Constraints / preferences
 - **Disk is tight on this machine.** Delete reproducible artifacts (yt-dlp caches, demo tracks,

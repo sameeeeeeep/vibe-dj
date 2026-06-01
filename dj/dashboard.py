@@ -13,14 +13,25 @@ Endpoints:
                        "value": <float>, "url": <str>}
                       cmds: skip | force | cue | pause | nudge | crowd_manual |
                             crowd_set | eq | eq_kill | trim | bend | xfade |
-                            add_url
+                            transition_kind | seek | add_url | queue_add |
+                            queue_remove | queue_move | queue_clear |
+                            set_mix_in | set_mix_out | mix_reset | cue_device |
+                            cue_source | cue_level | cue_audition |
+                            cue_audition_stop | beats_toggle | beats_enable |
+                            beats_level | beats_mode | beats_intensity |
+                            beats_style | fx_add_url | fx_trigger | fx_level |
+                            fx_clear | melody_load | melody_toggle |
+                            melody_enable | melody_level | melody_transpose |
+                            melody_clear
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -48,6 +59,16 @@ class Dashboard:
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        # Output-device list for the cue/monitor picker. Enumerating PortAudio
+        # devices is comparatively slow and we must keep re-checking it (AirPods
+        # only appear once connected, which happens after launch), so cache it
+        # and refresh on a slow cadence rather than every SSE frame.
+        self._cue_devices: list[dict] = []
+        self._cue_devices_ts = 0.0
+        # Discoverable .mid files for the melody-layer picker (scanning the disk
+        # every SSE frame would be wasteful) — refreshed on a slow cadence.
+        self._midi_files: list[dict] = []
+        self._midi_files_ts = 0.0
 
     # ---- state -----------------------------------------------------------
     def _deck_info(self, name: str) -> dict:
@@ -79,35 +100,121 @@ class Dashboard:
             "bend": round(d.bend, 4),
             "trim": round(self.mixer.trim[name], 3),
             "eq": {"low": round(eqm[0], 3), "mid": round(eqm[1], 3), "high": round(eqm[2], 3)},
-            "bass_auto": round(self.mixer.bass_auto[name], 3),
+            # Low-band auto factor (bass swap / filter sweep) for the swap meter.
+            "bass_auto": round(self.mixer.eq_auto[name][0], 3),
             # beat grid + phrase cues, for the live pulse and cue markers
             "beat_offset": round(an.beat_offset, 4) if an else 0.0,
             "beat_period": round(an.beat_period, 4) if an else 0.0,
             "phrase_period": round(an.phrase_period, 4) if an else 0.0,
-            "mix_in": round(an.mix_in_sec(), 2) if an else 0.0,
-            "mix_out": round(an.mix_out_sec(), 2) if an else 0.0,
+            # Effective cue points = DJ override if hand-set, else analysis
+            # default; the *_custom flags let the UI flag a marker as DJ-moved.
+            "mix_in": round(d.eff_mix_in(), 2) if an else 0.0,
+            "mix_out": round(d.eff_mix_out(), 2) if an else 0.0,
+            "mix_in_custom": d.mix_in_override is not None,
+            "mix_out_custom": d.mix_out_override is not None,
             "intro_end": round(an.intro_end, 2) if an else 0.0,
             "outro_start": round(an.outro_start, 2) if an else 0.0,
         }
 
     def _buffer_info(self) -> list[dict]:
+        """The whole downloaded crate: every library track, tagged with whether
+        it's on a deck right now or already in the DJ's queue. `tid` is the
+        Python id() as a string — a stable per-session handle the browser passes
+        back to queue/reorder a specific track."""
         loaded_ids = {id(t) for t in self.controller.deck_tracks.values() if t is not None}
+        queued_ids = {id(t) for t in self.controller.queue_view()}
         out = []
         for t in self.library.tracks:
             out.append({
+                "tid": str(id(t)),
                 "name": t.name,
                 "bpm": round(t.bpm, 1),
                 "energy": round(t.energy, 3),
                 "play_count": t.play_count,
                 "loaded": id(t) in loaded_ids,
+                "queued": id(t) in queued_ids,
             })
         return out
 
-    def snapshot(self) -> dict:
-        return {
+    def _queue_info(self) -> list[dict]:
+        """The DJ's manual queue, in play order (head first)."""
+        return [
+            {"tid": str(id(t)), "name": t.name,
+             "bpm": round(t.bpm, 1), "energy": round(t.energy, 3)}
+            for t in self.controller.queue_view()
+        ]
+
+    def crate_rev(self) -> int:
+        """A cheap signature of everything the crate view shows. When it's
+        unchanged we can skip re-sending the (large) full track list — only the
+        light per-frame state goes out. Changes on: a track added (len), a track
+        played (play_count), the live decks, or the DJ queue."""
+        tracks = self.library.tracks
+        loaded = tuple(sorted(id(t) for t in self.controller.deck_tracks.values() if t is not None))
+        queued = tuple(id(t) for t in self.controller.queue_view())
+        plays = sum(t.play_count for t in tracks)
+        return hash((len(tracks), plays, loaded, queued))
+
+    def _cue_devices_cached(self) -> list[dict]:
+        """Output devices for the monitor picker, refreshed at most every ~2 s.
+        AirPods (and any BT output) only enumerate once connected, which is
+        usually after launch, so we can't snapshot the list once — but we also
+        don't want a PortAudio scan on every SSE frame."""
+        now = time.monotonic()
+        if now - self._cue_devices_ts >= 2.0:
+            try:
+                self._cue_devices = self.mixer.list_output_devices()
+            except Exception:  # noqa: BLE001 - never let device scan break the feed
+                self._cue_devices = []
+            self._cue_devices_ts = now
+        return self._cue_devices
+
+    def _midi_files_cached(self) -> list[dict]:
+        """Find .mid/.midi files to offer in the melody picker. Scans the cwd, a
+        ./midi folder, and the active library folder (one level), capped + cached
+        on a slow cadence so it never competes with the audio callback."""
+        now = time.monotonic()
+        if now - self._midi_files_ts < 3.0:
+            return self._midi_files
+        roots = [os.getcwd(), os.path.join(os.getcwd(), "midi")]
+        lib_folder = getattr(self.library, "folder", None)
+        if isinstance(lib_folder, str):
+            roots.append(lib_folder)
+        seen: set[str] = set()
+        found: list[dict] = []
+        for root in roots:
+            try:
+                names = sorted(os.listdir(root))
+            except OSError:
+                continue
+            for fn in names:
+                if not fn.lower().endswith((".mid", ".midi")):
+                    continue
+                full = os.path.abspath(os.path.join(root, fn))
+                if full in seen or not os.path.isfile(full):
+                    continue
+                seen.add(full)
+                found.append({"name": fn, "path": full})
+                if len(found) >= 40:
+                    break
+            if len(found) >= 40:
+                break
+        self._midi_files = found
+        self._midi_files_ts = now
+        return found
+
+    def snapshot(self, include_buffer: bool = True) -> dict:
+        snap = {
             "live": self.mixer.current,
             "paused": self.mixer.paused,
             "transition": self.mixer.transition_state(),
+            "transition_kind": self.controller.transition_kind,
+            "cue": self.mixer.cue_state(),
+            "cue_devices": self._cue_devices_cached(),
+            "beats": self.mixer.beats_state(),
+            "fx": self.mixer.fx_state(),
+            "melody": self.mixer.melody_state(),
+            "midi_files": self._midi_files_cached(),
             "decks": {"A": self._deck_info("A"), "B": self._deck_info("B")},
             "crowd": {
                 "energy": round(self.controller.effective_crowd(), 3),
@@ -118,9 +225,17 @@ class Dashboard:
             },
             "target_energy": round(self.controller.current_target(), 3),
             "energy_bias": round(self.controller.energy_bias, 3),
-            "buffer": self._buffer_info(),
+            "crate_rev": self.crate_rev(),
+            "queue": self._queue_info(),
             "log": [{"t": t, "m": m} for (t, m) in self.controller.recent_events(14)],
         }
+        # The full downloaded crate can be 100s of tracks (~30 KB JSON). Sending
+        # it 3x/sec per client is needless GIL/serialisation load that competes
+        # with the audio callback, so it rides along only when it actually
+        # changed; the browser keeps its last render otherwise.
+        if include_buffer:
+            snap["buffer"] = self._buffer_info()
+        return snap
 
     def handle_command(self, payload: dict) -> None:
         cmd = str(payload.get("cmd", ""))
@@ -154,12 +269,92 @@ class Dashboard:
             self.mixer.set_bend(deck, value)
         elif cmd == "xfade":
             self.mixer.scrub_crossfade(value)
+        elif cmd == "transition_kind":
+            self.controller.set_transition_kind(str(payload.get("kind", "")))
+        elif cmd == "seek":
+            self.mixer.seek(deck, value)
         elif cmd == "add_url":
             url = str(payload.get("url", "")).strip()
             if url.startswith(("http://", "https://")):
                 self._enqueue_url(url)
             else:
                 self.controller.log("[add]   ignored (need an http(s) link)")
+        elif cmd == "queue_add":
+            self.controller.queue_add(self._tid(payload))
+        elif cmd == "queue_remove":
+            self.controller.queue_remove(self._tid(payload))
+        elif cmd == "queue_move":
+            self.controller.queue_move(self._tid(payload), value)
+        elif cmd == "queue_clear":
+            self.controller.queue_clear()
+        # ---- custom transition cue points (per-deck overrides) -------------
+        elif cmd == "set_mix_in":
+            self.mixer.set_mix_in(deck, value)
+        elif cmd == "set_mix_out":
+            self.mixer.set_mix_out(deck, value)
+        elif cmd == "mix_reset":
+            # A negative seconds value clears the override back to the analysis
+            # default; reset both cues for the deck.
+            self.mixer.set_mix_in(deck, -1.0)
+            self.mixer.set_mix_out(deck, -1.0)
+        # ---- second output: headphone cue / monitor -----------------------
+        elif cmd == "cue_device":
+            self.mixer.set_cue_device(payload.get("device"))
+        elif cmd == "cue_source":
+            self.mixer.set_cue_source(str(payload.get("source", "")))
+        elif cmd == "cue_level":
+            self.mixer.set_cue_level(value)
+        elif cmd == "cue_audition":
+            self.mixer.start_audition(self.controller.crossfade_sec)
+        elif cmd == "cue_audition_stop":
+            self.mixer.stop_audition()
+        # ---- drum-loop layer ("beats" pad) --------------------------------
+        elif cmd == "beats_toggle":
+            self.mixer.beats.toggle()
+        elif cmd == "beats_enable":
+            self.mixer.beats.set_enabled(value >= 0.5)
+        elif cmd == "beats_level":
+            self.mixer.beats.set_level(value)
+        elif cmd == "beats_mode":
+            self.mixer.beats.set_mode(str(payload.get("mode", "")))
+        elif cmd == "beats_intensity":
+            self.mixer.beats.set_intensity(value)
+        elif cmd == "beats_style":
+            self.mixer.beats.set_style(str(payload.get("style", "")))
+        # ---- sound-FX rack ------------------------------------------------
+        elif cmd == "fx_add_url":
+            url = str(payload.get("url", "")).strip()
+            if url.startswith(("http://", "https://")):
+                self._enqueue_fx(url)
+            else:
+                self.controller.log("[fx]    ignored (need an http(s) link)")
+        elif cmd == "fx_trigger":
+            self.mixer.fx.trigger(int(value))
+        elif cmd == "fx_level":
+            self.mixer.fx.set_level(value)
+        elif cmd == "fx_clear":
+            self.mixer.fx.clear(int(value))
+        # ---- MIDI melody layer --------------------------------------------
+        elif cmd == "melody_load":
+            self.mixer.melody.load(str(payload.get("path", "")), log=self.controller.log)
+        elif cmd == "melody_toggle":
+            self.mixer.melody.toggle()
+        elif cmd == "melody_enable":
+            self.mixer.melody.set_enabled(value >= 0.5)
+        elif cmd == "melody_level":
+            self.mixer.melody.set_level(value)
+        elif cmd == "melody_transpose":
+            self.mixer.melody.set_transpose(value)
+        elif cmd == "melody_clear":
+            self.mixer.melody.clear()
+
+    @staticmethod
+    def _tid(payload: dict) -> int:
+        """Parse the track handle the browser sent back (id() as a string)."""
+        try:
+            return int(payload.get("tid", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
 
     def _enqueue_url(self, url: str) -> None:
         """Fetch + analyse a pasted URL on a worker thread so the POST returns
@@ -178,6 +373,14 @@ class Dashboard:
                 return
             for t in (added or []):
                 log(f"[add]   ready {t.name}  {t.bpm:.0f} BPM  energy {t.energy:.2f}")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _enqueue_fx(self, url: str) -> None:
+        """Download + trim a one-shot FX pad on a worker thread so the POST
+        returns at once; the pad shows as 'loading' then 'ready' in the rack."""
+        def work() -> None:
+            self.mixer.fx.add_from_url(url, log=self.controller.log)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -240,9 +443,15 @@ class Dashboard:
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "keep-alive")
                 self.end_headers()
+                last_rev = None
                 try:
                     while not dashboard._stop.is_set():
-                        data = json.dumps(dashboard.snapshot())
+                        rev = dashboard.crate_rev()
+                        # Ship the heavy track list only when the crate changed
+                        # (and on the first frame so a fresh client gets it).
+                        include = rev != last_rev
+                        last_rev = rev
+                        data = json.dumps(dashboard.snapshot(include_buffer=include))
                         self.wfile.write(f"data: {data}\n\n".encode())
                         self.wfile.flush()
                         dashboard._stop.wait(0.33)
@@ -483,6 +692,45 @@ PAGE = r"""<!doctype html>
   .cdot{width:8px;height:8px;border-radius:50%;}
   .card-empty{color:var(--td);font-family:var(--f-mono);font-size:12px;padding:8px;}
 
+  /* manual queue + crate browser (list rows) */
+  .queue-list{display:flex;flex-direction:column;gap:6px;}
+  .crate-head{display:flex;align-items:center;justify-content:space-between;
+    margin-top:8px;padding-top:13px;border-top:1px solid var(--border-soft);}
+  .crate-head-l{font-family:var(--f-disp);font-weight:600;font-size:12px;letter-spacing:.12em;color:var(--td);}
+  .crate-head-l span{color:var(--tp);}
+  .crate-head-r{font-family:var(--f-mono);font-size:10px;letter-spacing:.06em;color:var(--tf);}
+  .crate-list{display:flex;flex-direction:column;gap:6px;max-height:340px;overflow-y:auto;
+    margin-top:12px;padding-right:4px;}
+  .crate-list::-webkit-scrollbar{width:8px;}
+  .crate-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px;}
+  .qrow,.crow{display:flex;align-items:center;gap:12px;padding:9px 12px;border-radius:10px;
+    background:var(--bg-raised);border:1px solid var(--border);}
+  .qrow{border-color:var(--deck-a-dim);background:#0B161C;}
+  .crow.on{border-color:var(--deck-a-dim);background:#0B161C;}
+  .qnum,.cnum2{font-family:var(--f-mono);font-size:11px;color:var(--tf);width:22px;text-align:right;flex:none;}
+  .qname,.cname2{flex:1;min-width:0;font-family:var(--f-disp);font-weight:600;font-size:14px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .qmeta,.cmeta{display:flex;align-items:center;gap:8px;flex:none;
+    font-family:var(--f-num);font-weight:600;font-size:13px;color:var(--td);}
+  .qmeta small,.cmeta small{font-family:var(--f-mono);font-size:8px;letter-spacing:.06em;color:var(--tf);}
+  .cdot2{width:8px;height:8px;border-radius:50%;flex:none;}
+  .pc-tag{font-family:var(--f-mono);font-size:9px;letter-spacing:.04em;color:var(--tf);}
+  .qbtns,.cbtns{display:flex;gap:5px;flex:none;}
+  .iconbtn{font-family:var(--f-mono);font-size:12px;line-height:1;min-width:30px;height:28px;padding:0 8px;
+    border-radius:7px;cursor:pointer;background:var(--bg-inset);border:1px solid var(--border);color:var(--td);
+    transition:border-color .15s,color .15s,transform .05s;}
+  .iconbtn:hover{color:var(--tp);border-color:var(--td);}
+  .iconbtn:active{transform:translateY(1px);}
+  .iconbtn.add{color:var(--deck-a);border-color:var(--deck-a-dim);background:#0C2630;
+    font-family:var(--f-disp);font-weight:600;font-size:10px;letter-spacing:.05em;}
+  .iconbtn.add:hover{border-color:var(--deck-a);}
+  .iconbtn.add.queued{color:var(--ok);border-color:#1C3A2B;background:#0F2018;}
+  .iconbtn.ondeck{color:var(--deck-a);border-color:var(--deck-a-dim);background:#0C2630;cursor:default;
+    font-family:var(--f-disp);font-weight:600;font-size:10px;letter-spacing:.05em;}
+  .iconbtn.ondeck:active{transform:none;}
+  .queue-empty,.crate-empty{color:var(--tf);font-family:var(--f-mono);font-size:11px;line-height:1.7;
+    padding:14px 10px;text-align:center;}
+
   /* master transport (topbar play/pause) */
   .transport{display:flex;align-items:center;gap:8px;background:var(--ok);color:#04140C;border:none;
     border-radius:9px;padding:9px 15px;font-family:var(--f-disp);font-weight:700;font-size:13px;
@@ -502,9 +750,155 @@ PAGE = r"""<!doctype html>
 
   /* waveform overlay: phrase cue markers + moving playhead */
   .wavewrap{position:relative;}
-  .cue{position:absolute;top:-5px;bottom:-5px;width:2px;z-index:2;pointer-events:none;display:none;}
-  .cue-in{background:var(--ok);box-shadow:0 0 6px var(--ok);}
-  .cue-out{background:var(--danger);box-shadow:0 0 6px var(--danger);}
+  .cue{position:absolute;top:-6px;bottom:-6px;width:2px;z-index:3;display:none;margin-left:-1px;
+    cursor:ew-resize;touch-action:none;color:var(--ok);}
+  .cue-in{background:var(--ok);box-shadow:0 0 6px var(--ok);color:var(--ok);}
+  .cue-out{background:var(--danger);box-shadow:0 0 6px var(--danger);color:var(--danger);}
+  .cue-grip{position:absolute;top:-11px;left:50%;transform:translateX(-50%);width:14px;height:13px;
+    border-radius:3px;background:currentColor;box-shadow:0 0 5px currentColor;
+    display:flex;align-items:center;justify-content:center;cursor:ew-resize;}
+  .cue-grip::before{content:"";width:2px;height:6px;background:rgba(0,0,0,.5);
+    box-shadow:3px 0 rgba(0,0,0,.5),-3px 0 rgba(0,0,0,.5);}
+  .cue-lab{position:absolute;top:-24px;left:50%;transform:translateX(-50%);font-family:var(--f-mono);
+    font-size:8px;font-weight:700;letter-spacing:.08em;color:currentColor;white-space:nowrap;}
+  .cue.custom .cue-grip{outline:1.5px solid #fff;outline-offset:-1px;}
+  .cue.custom .cue-lab::after{content:" ✎";}
+
+  /* monitor / headphone-cue panel (second audio output) */
+  .cuepanel{margin-top:10px;padding:11px 12px;background:var(--bg-inset);border:1px solid var(--border-soft);
+    border-radius:10px;display:flex;flex-direction:column;gap:9px;}
+  .cue-row1{display:flex;align-items:center;justify-content:space-between;}
+  .cue-ttl{font-family:var(--f-disp);font-weight:600;font-size:11px;letter-spacing:.14em;color:var(--td);
+    display:flex;align-items:center;gap:7px;}
+  .cue-ttl svg{color:var(--accent);}
+  .cue-state{font-family:var(--f-mono);font-size:9px;letter-spacing:.1em;color:var(--tf);
+    border:1px solid var(--border);border-radius:6px;padding:3px 7px;}
+  .cue-state.on{color:var(--ok);border-color:var(--ok);}
+  .cue-state.aud{color:var(--accent);border-color:var(--accent);}
+  .cue-dev{width:100%;background:var(--bg-raised);color:var(--tp);border:1px solid var(--border);
+    border-radius:7px;padding:7px 9px;font-family:var(--f-body);font-size:12px;}
+  .cue-row2{display:flex;gap:8px;align-items:center;}
+  .cue-src{display:flex;flex:1;gap:0;border:1px solid var(--border);border-radius:7px;overflow:hidden;}
+  .cue-src button{flex:1;background:transparent;color:var(--td);border:none;border-right:1px solid var(--border);
+    padding:7px 0;font-family:var(--f-mono);font-size:9px;letter-spacing:.08em;cursor:pointer;}
+  .cue-src button:last-child{border-right:none;}
+  .cue-src button.active{background:var(--accent);color:#fff;}
+  .cue-row3{display:flex;align-items:center;gap:9px;}
+  .cue-lvl-lab{font-family:var(--f-mono);font-size:9px;letter-spacing:.1em;color:var(--tf);}
+  .cue-lvl{flex:1;}
+  .aud-btn{position:relative;overflow:hidden;width:100%;background:var(--bg-raised);color:var(--tp);
+    border:1px solid var(--accent);border-radius:8px;padding:9px 0;font-family:var(--f-disp);font-weight:600;
+    font-size:11px;letter-spacing:.1em;cursor:pointer;}
+  .aud-btn:disabled{opacity:.4;cursor:not-allowed;border-color:var(--border);}
+  .aud-btn.live{background:var(--accent);color:#fff;}
+  .aud-prog{position:absolute;left:0;top:0;bottom:0;width:0;background:rgba(255,255,255,.16);
+    pointer-events:none;z-index:0;}
+  .aud-btn span:not(.aud-prog){position:relative;z-index:1;}
+  .cue-err{font-family:var(--f-mono);font-size:9px;color:var(--danger);min-height:0;}
+  .cue-err:empty{display:none;}
+
+  /* transition-style picker */
+  .txpanel{margin-top:10px;padding:11px 12px;background:var(--bg-inset);border:1px solid var(--border-soft);
+    border-radius:10px;display:flex;flex-direction:column;gap:9px;}
+  .tx-row1{display:flex;align-items:center;justify-content:space-between;}
+  .tx-ttl{font-family:var(--f-mono);font-size:9px;letter-spacing:.16em;color:var(--td);}
+  .tx-now{font-family:var(--f-mono);font-size:9px;letter-spacing:.08em;color:var(--tf);}
+  .tx-now.live{color:var(--accent);}
+  .tx-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;}
+  .tx-grid button{background:var(--bg-raised);color:var(--td);border:1px solid var(--border);border-radius:6px;
+    padding:9px 0;font-family:var(--f-mono);font-size:9px;letter-spacing:.05em;cursor:pointer;
+    transition:background .12s,color .12s,border-color .12s;}
+  .tx-grid button:hover{border-color:var(--td);color:var(--tp);}
+  .tx-grid button.active{background:var(--accent);color:#fff;border-color:var(--accent);}
+  .tx-grid button.firing{box-shadow:0 0 14px var(--accent);border-color:var(--accent);color:var(--tp);}
+
+  /* drum-loop layer ("beats" pad) */
+  .beatspanel{margin-top:10px;padding:11px 12px;background:var(--bg-inset);border:1px solid var(--border-soft);
+    border-radius:10px;display:flex;flex-direction:column;gap:9px;}
+  .beats-row1{display:flex;align-items:center;gap:9px;}
+  .beats-pad{flex:1;display:flex;align-items:center;justify-content:center;gap:9px;background:var(--bg-raised);
+    color:var(--td);border:1px solid var(--border);border-radius:8px;padding:11px 0;font-family:var(--f-disp);
+    font-weight:700;font-size:13px;letter-spacing:.16em;cursor:pointer;transition:background .12s,color .12s,box-shadow .12s;}
+  .beats-pad.on{background:var(--deck-b);color:#1A1206;border-color:var(--deck-b);box-shadow:0 0 18px var(--deck-b-dim);}
+  .pad-dot{width:7px;height:7px;border-radius:50%;background:currentColor;opacity:.45;}
+  .beats-pad.on .pad-dot{opacity:1;animation:beatpulse .5s steps(1,end) infinite;}
+  @keyframes beatpulse{0%{opacity:1}50%{opacity:.3}}
+  .beats-mode{display:flex;border:1px solid var(--border);border-radius:7px;overflow:hidden;}
+  .beats-mode button{background:transparent;color:var(--td);border:none;border-right:1px solid var(--border);
+    padding:0 12px;height:42px;font-family:var(--f-mono);font-size:9px;letter-spacing:.08em;cursor:pointer;}
+  .beats-mode button:last-child{border-right:none;}
+  .beats-mode button.active{background:var(--accent);color:#fff;}
+  .beats-row2,.beats-row3{display:flex;align-items:center;gap:9px;}
+  .beats-lab{font-family:var(--f-mono);font-size:9px;letter-spacing:.1em;color:var(--tf);width:34px;}
+  .beats-row2 input,.beats-row3 input{flex:1;}
+  .beats-row2 input:disabled{opacity:.5;}
+  .beats-val{font-family:var(--f-mono);font-size:10px;color:var(--td);width:34px;text-align:right;}
+  .beats-styles{display:grid;grid-template-columns:repeat(4,1fr);gap:5px;}
+  .beats-styles button{background:var(--bg-raised);color:var(--td);border:1px solid var(--border);
+    border-radius:6px;padding:7px 0;font-family:var(--f-mono);font-size:9px;letter-spacing:.06em;
+    cursor:pointer;transition:background .12s,color .12s,box-shadow .12s;}
+  .beats-styles button.active{background:var(--deck-b);color:#1A1206;border-color:var(--deck-b);}
+  .beats-styles button.autopick{box-shadow:inset 0 0 0 1px var(--deck-b-dim);color:var(--deck-b);}
+
+  /* sound-FX rack */
+  .fxpanel{margin-top:10px;padding:11px 12px;background:var(--bg-inset);border:1px solid var(--border-soft);
+    border-radius:10px;display:flex;flex-direction:column;gap:9px;}
+  .fx-head{display:flex;align-items:center;justify-content:space-between;}
+  .fx-ttl{font-family:var(--f-disp);font-weight:700;font-size:12px;letter-spacing:.16em;color:var(--td);}
+  .fx-hint{font-family:var(--f-mono);font-size:9px;letter-spacing:.04em;color:var(--tf);}
+  .fx-row1{display:flex;gap:7px;}
+  .fx-row1 input{flex:1;min-width:0;background:var(--bg-raised);border:1px solid var(--border);border-radius:7px;
+    color:var(--tp);font-family:var(--f-mono);font-size:11px;padding:0 10px;height:34px;}
+  .fx-row1 input::placeholder{color:var(--tf);}
+  .fx-add{background:var(--accent);color:#fff;border:none;border-radius:7px;padding:0 14px;height:34px;
+    font-family:var(--f-mono);font-size:10px;letter-spacing:.1em;cursor:pointer;}
+  .fx-pads{display:grid;grid-template-columns:repeat(2,1fr);gap:6px;min-height:6px;}
+  .fx-pad{display:flex;align-items:center;gap:7px;background:var(--bg-raised);border:1px solid var(--border);
+    border-radius:7px;padding:8px 9px;cursor:pointer;transition:background .1s,box-shadow .1s,border-color .1s;}
+  .fx-pad .fx-nm{flex:1;min-width:0;font-family:var(--f-body);font-size:11px;color:var(--tp);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .fx-pad .fx-dur{font-family:var(--f-mono);font-size:9px;color:var(--tf);flex:none;}
+  .fx-pad.ready:hover{border-color:var(--accent);}
+  .fx-pad.ready:active,.fx-pad.firing{background:var(--accent);border-color:var(--accent);box-shadow:0 0 14px var(--accent);}
+  .fx-pad.firing .fx-nm,.fx-pad.firing .fx-dur{color:#fff;}
+  .fx-pad.loading{opacity:.6;cursor:default;}
+  .fx-pad.loading .fx-dur{color:var(--warn);}
+  .fx-x{flex:none;width:16px;height:16px;border-radius:4px;border:1px solid var(--border);background:transparent;
+    color:var(--tf);font-size:11px;line-height:1;cursor:pointer;padding:0;}
+  .fx-x:hover{color:var(--danger);border-color:var(--danger);}
+  .fx-empty{grid-column:1/-1;font-family:var(--f-mono);font-size:9px;color:var(--tf);text-align:center;padding:6px 0;}
+  .fx-rowlvl{display:flex;align-items:center;gap:9px;}
+  .fx-rowlvl input{flex:1;}
+
+  /* MIDI melody layer */
+  .melpanel{margin-top:10px;padding:11px 12px;background:var(--bg-inset);border:1px solid var(--border-soft);
+    border-radius:10px;display:flex;flex-direction:column;gap:9px;}
+  .mel-head{display:flex;align-items:center;gap:9px;}
+  .mel-pad{display:flex;align-items:center;justify-content:center;gap:8px;background:var(--bg-raised);
+    color:var(--td);border:1px solid var(--border);border-radius:8px;padding:9px 14px;font-family:var(--f-disp);
+    font-weight:700;font-size:12px;letter-spacing:.14em;cursor:pointer;flex:none;
+    transition:background .12s,color .12s,box-shadow .12s;}
+  .mel-pad.on{background:var(--accent);color:#fff;border-color:var(--accent);box-shadow:0 0 16px var(--accent);}
+  .mel-pad.on .pad-dot{opacity:1;animation:beatpulse .5s steps(1,end) infinite;}
+  .mel-now{flex:1;min-width:0;font-family:var(--f-mono);font-size:9px;letter-spacing:.04em;color:var(--td);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .mel-row1{display:flex;gap:7px;}
+  .mel-row1 select{flex:1;min-width:0;background:var(--bg-raised);border:1px solid var(--border);border-radius:7px;
+    color:var(--tp);font-family:var(--f-mono);font-size:10px;padding:0 8px;height:32px;}
+  .mel-load{background:var(--accent);color:#fff;border:none;border-radius:7px;padding:0 13px;height:32px;
+    font-family:var(--f-mono);font-size:10px;letter-spacing:.1em;cursor:pointer;}
+  .mel-clr{background:transparent;border:1px solid var(--border);border-radius:7px;color:var(--tf);width:32px;
+    height:32px;font-size:14px;line-height:1;cursor:pointer;padding:0;}
+  .mel-clr:hover{color:var(--danger);border-color:var(--danger);}
+  .mel-path{background:var(--bg-raised);border:1px solid var(--border);border-radius:7px;color:var(--tp);
+    font-family:var(--f-mono);font-size:10px;padding:0 10px;height:30px;}
+  .mel-path::placeholder{color:var(--tf);}
+  .mel-row2{display:flex;align-items:center;gap:7px;}
+  .mel-tb{background:var(--bg-raised);border:1px solid var(--border);border-radius:6px;color:var(--td);
+    width:26px;height:26px;font-size:14px;line-height:1;cursor:pointer;padding:0;}
+  .mel-tb:hover{border-color:var(--accent);color:var(--tp);}
+  .mel-tr{font-family:var(--f-mono);font-size:12px;color:var(--tp);width:30px;text-align:center;}
+  .mel-row2 input{flex:1;min-width:60px;}
   .cue::before{content:"";position:absolute;top:-4px;left:-2px;width:6px;height:6px;border-radius:1px;background:inherit;}
   .playhead{position:absolute;top:-5px;bottom:-5px;left:0;width:2px;background:var(--tp);z-index:3;
     pointer-events:none;box-shadow:0 0 7px #fff9;}
@@ -710,8 +1104,8 @@ PAGE = r"""<!doctype html>
       </div>
       <div class="wavewrap">
         <div class="wave" id="A-wave"></div>
-        <div class="cue cue-in" id="A-cue-in"></div>
-        <div class="cue cue-out" id="A-cue-out"></div>
+        <div class="cue cue-in" id="A-cue-in" data-deck="A" data-which="in"><span class="cue-lab">IN</span><span class="cue-grip"></span></div>
+        <div class="cue cue-out" id="A-cue-out" data-deck="A" data-which="out"><span class="cue-lab">OUT</span><span class="cue-grip"></span></div>
         <div class="playhead" id="A-head"></div>
       </div>
       <div class="deck-foot"><span id="A-pos">0:00</span><span class="foot-mid" id="A-mid"></span><span id="A-dur">0:00</span></div>
@@ -793,6 +1187,129 @@ PAGE = r"""<!doctype html>
         <button class="mx-btn skip" onclick="send('skip')">SKIP</button>
         <button class="mx-btn force" onclick="send('force')">FORCE MIX</button>
       </div>
+
+      <div class="txpanel">
+        <div class="tx-row1">
+          <span class="tx-ttl">TRANSITION STYLE</span>
+          <span class="tx-now" id="tx-now">AUTO</span>
+        </div>
+        <div class="tx-grid" id="tx-grid">
+          <button data-tk="auto"      onclick="post({cmd:'transition_kind',kind:'auto'})">AUTO</button>
+          <button data-tk="smooth"    onclick="post({cmd:'transition_kind',kind:'smooth'})">BLEND</button>
+          <button data-tk="bass_swap" onclick="post({cmd:'transition_kind',kind:'bass_swap'})">BASS SWAP</button>
+          <button data-tk="filter"    onclick="post({cmd:'transition_kind',kind:'filter'})">FILTER</button>
+          <button data-tk="cut"       onclick="post({cmd:'transition_kind',kind:'cut'})">CUT</button>
+          <button data-tk="echo"      onclick="post({cmd:'transition_kind',kind:'echo'})">ECHO</button>
+          <button data-tk="brake"     onclick="post({cmd:'transition_kind',kind:'brake'})">BRAKE</button>
+        </div>
+      </div>
+
+      <div class="cuepanel">
+        <div class="cue-row1">
+          <span class="cue-ttl"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/></svg>MONITOR</span>
+          <span class="cue-state" id="cue-state">OFF</span>
+        </div>
+        <select class="cue-dev" id="cue-dev" onchange="post({cmd:'cue_device', device:this.value})">
+          <option value="off">— monitor off —</option>
+        </select>
+        <div class="cue-row2">
+          <div class="cue-src" id="cue-src">
+            <button data-src="cued" onclick="post({cmd:'cue_source',source:'cued'})">CUED</button>
+            <button data-src="live" onclick="post({cmd:'cue_source',source:'live'})">LIVE</button>
+            <button data-src="master" onclick="post({cmd:'cue_source',source:'master'})">MASTER</button>
+          </div>
+        </div>
+        <div class="cue-row3">
+          <span class="cue-lvl-lab">LVL</span>
+          <input class="cue-lvl" id="cue-lvl" type="range" min="0" max="100" value="100"
+                 oninput="post({cmd:'cue_level', value:this.value/100})">
+        </div>
+        <button class="aud-btn" id="aud-btn" onclick="toggleAudition()">
+          <span class="aud-prog" id="aud-prog"></span>
+          <span id="aud-txt">AUDITION TRANSITION</span>
+        </button>
+        <div class="cue-err" id="cue-err"></div>
+      </div>
+
+      <div class="beatspanel">
+        <div class="beats-row1">
+          <button class="beats-pad" id="beats-pad" onclick="post({cmd:'beats_toggle'})">
+            <span class="pad-dot"></span><span id="beats-pad-txt">BEATS</span>
+          </button>
+          <div class="beats-mode" id="beats-mode">
+            <button data-bmode="auto" onclick="post({cmd:'beats_mode',mode:'auto'})">AUTO</button>
+            <button data-bmode="manual" onclick="post({cmd:'beats_mode',mode:'manual'})">MANUAL</button>
+          </div>
+        </div>
+        <div class="beats-row2">
+          <span class="beats-lab">VIBE</span>
+          <input id="beats-int" type="range" min="0" max="100" value="50"
+                 oninput="post({cmd:'beats_intensity', value:this.value/100})">
+          <span class="beats-val" id="beats-int-v">.50</span>
+        </div>
+        <div class="beats-row3">
+          <span class="beats-lab">MIX</span>
+          <input id="beats-lvl" type="range" min="0" max="100" value="55"
+                 oninput="post({cmd:'beats_level', value:this.value/100})">
+          <span class="beats-val" id="beats-lvl-v">.55</span>
+        </div>
+        <div class="beats-styles" id="beats-styles">
+          <button data-bstyle="auto" onclick="post({cmd:'beats_style',style:'auto'})">AUTO</button>
+          <button data-bstyle="four_floor" onclick="post({cmd:'beats_style',style:'four_floor'})">4-FLOOR</button>
+          <button data-bstyle="house" onclick="post({cmd:'beats_style',style:'house'})">HOUSE</button>
+          <button data-bstyle="techno" onclick="post({cmd:'beats_style',style:'techno'})">TECHNO</button>
+          <button data-bstyle="afro" onclick="post({cmd:'beats_style',style:'afro'})">AFRO</button>
+          <button data-bstyle="breakbeat" onclick="post({cmd:'beats_style',style:'breakbeat'})">BREAKS</button>
+          <button data-bstyle="trap" onclick="post({cmd:'beats_style',style:'trap'})">TRAP</button>
+        </div>
+      </div>
+
+      <div class="fxpanel">
+        <div class="fx-head">
+          <span class="fx-ttl">FX RACK</span>
+          <span class="fx-hint" id="fx-hint">paste a link → one-shot pad</span>
+        </div>
+        <div class="fx-row1">
+          <input id="fx-url" type="text" spellcheck="false"
+                 placeholder="https://… (IG reel / YouTube / clip)"
+                 onkeydown="if(event.key==='Enter')fxAdd()">
+          <button class="fx-add" id="fx-add" onclick="fxAdd()">LOAD</button>
+        </div>
+        <div class="fx-pads" id="fx-pads"></div>
+        <div class="fx-rowlvl">
+          <span class="beats-lab">FX</span>
+          <input id="fx-lvl" type="range" min="0" max="100" value="80"
+                 oninput="post({cmd:'fx_level', value:this.value/100})">
+          <span class="beats-val" id="fx-lvl-v">.80</span>
+        </div>
+      </div>
+
+      <div class="melpanel">
+        <div class="mel-head">
+          <button class="mel-pad" id="mel-pad" onclick="post({cmd:'melody_toggle'})">
+            <span class="pad-dot"></span><span id="mel-pad-txt">MELODY</span>
+          </button>
+          <span class="mel-now" id="mel-now">no .mid loaded</span>
+        </div>
+        <div class="mel-row1">
+          <select id="mel-file"></select>
+          <button class="mel-load" onclick="melLoad()">LOAD</button>
+          <button class="mel-clr" title="clear" onclick="post({cmd:'melody_clear'})">&times;</button>
+        </div>
+        <input id="mel-path" class="mel-path" type="text" spellcheck="false"
+               placeholder="…or paste a .mid path"
+               onkeydown="if(event.key==='Enter')melLoadPath()">
+        <div class="mel-row2">
+          <span class="beats-lab">SEMI</span>
+          <button class="mel-tb" onclick="melTrans(-1)">&minus;</button>
+          <span class="mel-tr" id="mel-tr">0</span>
+          <button class="mel-tb" onclick="melTrans(1)">+</button>
+          <span class="beats-lab" style="margin-left:8px;">MIX</span>
+          <input id="mel-lvl" type="range" min="0" max="100" value="60"
+                 oninput="post({cmd:'melody_level', value:this.value/100})">
+          <span class="beats-val" id="mel-lvl-v">.60</span>
+        </div>
+      </div>
     </div>
 
     <div class="deck b" id="deckB">
@@ -814,8 +1331,8 @@ PAGE = r"""<!doctype html>
       </div>
       <div class="wavewrap">
         <div class="wave" id="B-wave"></div>
-        <div class="cue cue-in" id="B-cue-in"></div>
-        <div class="cue cue-out" id="B-cue-out"></div>
+        <div class="cue cue-in" id="B-cue-in" data-deck="B" data-which="in"><span class="cue-lab">IN</span><span class="cue-grip"></span></div>
+        <div class="cue cue-out" id="B-cue-out" data-deck="B" data-which="out"><span class="cue-lab">OUT</span><span class="cue-grip"></span></div>
         <div class="playhead" id="B-head"></div>
       </div>
       <div class="deck-foot"><span id="B-pos">0:00</span><span class="foot-mid" id="B-mid"></span><span id="B-dur">0:00</span></div>
@@ -888,16 +1405,20 @@ PAGE = r"""<!doctype html>
 
   <div class="upnext">
     <div class="up-head">
-      <div class="up-head-l"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg><span>UP NEXT</span></div>
+      <div class="up-head-l"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg><span>UP NEXT</span><span class="up-head-r" id="up-meta">AUTOPILOT</span></div>
       <div class="up-add">
         <input id="add-url" class="add-input" type="text" spellcheck="false"
                placeholder="paste a YouTube link to queue it…"
                onkeydown="if(event.key==='Enter')addUrl()">
         <button class="add-btn" onclick="addUrl()">+ ADD</button>
-        <span class="up-head-r" id="up-meta">MIX QUEUE</span>
       </div>
     </div>
-    <div class="cards" id="cards"></div>
+    <div class="queue-list" id="queue-list"></div>
+    <div class="crate-head">
+      <div class="crate-head-l">CRATE&nbsp;&middot;&nbsp;<span id="crate-count">0</span>&nbsp;DOWNLOADED</div>
+      <div class="crate-head-r">tap &#65291; to line a track up next</div>
+    </div>
+    <div class="crate-list" id="crate-list"></div>
   </div>
 
   <div class="logpanel">
@@ -1026,14 +1547,19 @@ function deck(p, d){
   $(p+"-mid").textContent = d.role==="live" ? "−"+fmt(d.remaining)+" TO MIX"
                           : (d.role==="cued" ? "CUE READY" : "");
 
-  // Phrase cue markers over the waveform (mix-in past the intro, mix-out at
-  // the outro). Hidden when there's no real structure (cue == 0 / == end).
+  // Phrase cue markers over the waveform: drag them to hand-set where the mix
+  // drops (IN) and where the outgoing track starts its fade (OUT). A ✎ flag
+  // means the DJ moved it off the analysis default. Frozen while being dragged.
   const dur=d.duration||0;
   const ci=$(p+"-cue-in"), co=$(p+"-cue-out");
-  if(dur>0 && d.mix_in>0.5){ ci.style.left=(100*d.mix_in/dur)+"%"; ci.style.display="block"; }
-  else ci.style.display="none";
-  if(dur>0 && d.mix_out>0 && d.mix_out<dur-0.5){ co.style.left=(100*d.mix_out/dur)+"%"; co.style.display="block"; }
-  else co.style.display="none";
+  if(dur>0){
+    if(!cueDrag[p].in) ci.style.left=(100*Math.max(0,Math.min(dur,d.mix_in||0))/dur)+"%";
+    ci.style.display="block"; ci.classList.toggle("custom", !!d.mix_in_custom);
+  } else ci.style.display="none";
+  if(dur>0){
+    if(!cueDrag[p].out) co.style.left=(100*Math.max(0,Math.min(dur,d.mix_out||0))/dur)+"%";
+    co.style.display="block"; co.classList.toggle("custom", !!d.mix_out_custom);
+  } else co.style.display="none";
 
   // SYNC/PLAY LEDs: PLAY tracks the playhead, SYNC lights whenever a track is
   // loaded (it's always beatmatched to the live deck on this engine).
@@ -1077,13 +1603,14 @@ function render(s){
   const tr=s.transition, xf=$("xfader");
   if(tr && tr.active){
     xf.classList.add("mixing");
-    $("xf-next-l").textContent = "MIXING " + tr.from + "→" + tr.to;
+    $("xf-next-l").textContent = (TX_LABELS[tr.kind]||"MIX") + " " + tr.from + "→" + tr.to;
     $("xf-next").textContent = Math.round(tr.progress*100)+"%";
   } else {
     xf.classList.remove("mixing");
     $("xf-next-l").textContent = "NEXT MIX";
     $("xf-next").textContent = fmt(s.decks[s.live] ? s.decks[s.live].remaining : 0);
   }
+  renderTx(s);
   // Bass-swap meter: the low-band energy each deck is actually putting out
   // (DJ EQ × auto bass-swap). During a clean blend these cross over.
   $("bs-A").style.width = (100*(s.decks.A.eq.low * s.decks.A.bass_auto))+"%";
@@ -1128,29 +1655,244 @@ function render(s){
     $("cam-foot").textContent = "MOTION SENSE · "+(s.crowd.mode||"").toUpperCase();
   }
 
-  $("rotation").textContent = s.buffer.length+(s.buffer.length===1?" TRACK":" TRACKS");
-  $("up-meta").textContent = "MIX QUEUE · "+s.buffer.length+" BUFFERED · LOOPING";
+  const queue = s.queue||[];
+  $("up-meta").textContent = queue.length
+    ? (queue.length+(queue.length===1?" QUEUED":" QUEUED")) : "AUTOPILOT";
 
-  const cards = s.buffer.slice(0,8).map((t,i)=>{
+  // Manual queue: ordered, reorderable. Head plays next.
+  $("queue-list").innerHTML = queue.map((t,i)=>{
     const ec=energyColor(t.energy);
-    let cls="card", badge;
-    if(t.loaded){ cls+=" on"; badge='<span class="cbadge live">ON DECK</span>'; }
-    else if(t.play_count>0){ badge='<span class="cbadge"><span class="dot dot-ok"></span>PLAYED '+t.play_count+'×</span>'; }
-    else { badge='<span class="cbadge"><span class="dot dot-faint"></span>QUEUED</span>'; }
-    let nm=t.name||"", art="";
-    const ix=nm.indexOf(" - ");
-    if(ix>0){ art=nm.slice(0,ix); nm=nm.slice(ix+3); }
-    return '<div class="'+cls+'">'
-      +'<div class="card-top"><span class="cnum">'+String(i+1).padStart(2,"0")+'</span>'+badge+'</div>'
-      +'<div class="card-title"><div class="cname">'+esc(nm)+'</div><div class="cart">'+esc(art)+'</div></div>'
-      +'<div class="card-bot"><div class="cbpm">'+t.bpm.toFixed(0)+'<small>BPM</small></div>'
-      +'<div class="cen"><span class="cdot" style="background:'+ec+'"></span>'
-      +'<span style="color:'+ec+'">'+t.energy.toFixed(2)+'</span></div></div></div>';
-  }).join("");
-  $("cards").innerHTML = cards || '<div class="card-empty">buffering…</div>';
+    return '<div class="qrow">'
+      +'<span class="qnum">'+(i+1)+'</span>'
+      +'<span class="qname">'+esc(t.name)+'</span>'
+      +'<span class="qmeta">'+t.bpm.toFixed(0)+'<small>BPM</small>'
+        +'<span class="cdot2" style="background:'+ec+'"></span></span>'
+      +'<span class="qbtns">'
+        +'<button class="iconbtn" title="move up" onclick="qmove(\''+t.tid+'\',-1)">&#9650;</button>'
+        +'<button class="iconbtn" title="move down" onclick="qmove(\''+t.tid+'\',1)">&#9660;</button>'
+        +'<button class="iconbtn" title="remove" onclick="qremove(\''+t.tid+'\')">&#10005;</button>'
+      +'</span></div>';
+  }).join("") || '<div class="queue-empty">queue is empty &mdash; the autopilot is choosing by crowd energy.<br>line up tracks from the crate below to take over.</div>';
 
+  // Crate: every downloaded track; click ＋ to queue it. The full list only
+  // rides along on SSE frames where it changed (s.buffer present); otherwise we
+  // keep the last render so the browser isn't repainting 100s of rows 3x/sec.
+  if(s.buffer){
+    const crate = s.buffer;
+    $("rotation").textContent = crate.length+(crate.length===1?" TRACK":" TRACKS");
+    $("crate-count").textContent = crate.length;
+    $("crate-list").innerHTML = crate.map((t,i)=>{
+      const ec=energyColor(t.energy);
+      let action;
+      if(t.loaded) action='<button class="iconbtn ondeck" disabled>ON DECK</button>';
+      else if(t.queued) action='<button class="iconbtn add queued" title="remove from queue" onclick="qremove(\''+t.tid+'\')">&#10003; QUEUED</button>';
+      else action='<button class="iconbtn add" title="add to queue" onclick="qadd(\''+t.tid+'\')">&#65291; QUEUE</button>';
+      const pc = t.play_count>0 ? '<span class="pc-tag">'+t.play_count+'&times;</span>' : '';
+      return '<div class="crow'+(t.loaded?' on':'')+'">'
+        +'<span class="cnum2">'+String(i+1).padStart(2,"0")+'</span>'
+        +'<span class="cname2">'+esc(t.name)+'</span>'
+        +'<span class="cmeta">'+pc+t.bpm.toFixed(0)+'<small>BPM</small>'
+          +'<span class="cdot2" style="background:'+ec+'"></span>'
+          +'<span style="color:'+ec+'">'+t.energy.toFixed(2)+'</span></span>'
+        +action+'</div>';
+    }).join("") || '<div class="crate-empty">no tracks downloaded yet&hellip;</div>';
+  }
+
+  renderCue(s.cue||{}, s.cue_devices||[]);
+  renderBeats(s.beats||{});
+  renderFx(s.fx||{});
+  renderMelody(s.melody||{}, s.midi_files||[]);
   renderLog(s.log||[]);
 }
+
+// ---- transition-style picker ------------------------------------------
+// AUTO lets the autopilot choose a style to fit each energy move; a specific
+// style forces every mix to use it. The readout names the running style + its
+// progress, and the live style pulses while it fires.
+const TX_LABELS = {auto:"AUTO", smooth:"BLEND", bass_swap:"BASS SWAP",
+                   filter:"FILTER", cut:"CUT", echo:"ECHO", brake:"BRAKE"};
+function renderTx(s){
+  const cur = s.transition_kind || "auto";
+  const tr = s.transition || {};
+  for(const b of $("tx-grid").children){
+    b.classList.toggle("active", b.dataset.tk===cur);
+    b.classList.toggle("firing", !!tr.active && b.dataset.tk===tr.kind);
+  }
+  const now=$("tx-now");
+  if(tr.active){
+    now.textContent = (TX_LABELS[tr.kind]||tr.kind||"") + " · " + Math.round(tr.progress*100)+"%";
+    now.classList.add("live");
+  } else {
+    now.classList.remove("live");
+    now.textContent = cur==="auto"
+      ? (tr.last_kind ? "AUTO · last "+(TX_LABELS[tr.last_kind]||tr.last_kind) : "AUTO")
+      : (TX_LABELS[cur]||cur);
+  }
+}
+
+// ---- drum-loop layer ("beats" pad) ------------------------------------
+// Toggle the synthesised drum layer over the live track. AUTO follows the
+// song's vibe (the slider mirrors it, read-only); MANUAL hands the intensity
+// dial to the DJ. MIX sets how loud the drums sit in the master.
+function fmtv(x){ return (x<0?"-":"")+Math.abs(x).toFixed(2).replace(/^0/,""); }
+function renderBeats(b){
+  const pad=$("beats-pad");
+  pad.classList.toggle("on", !!b.enabled);
+  $("beats-pad-txt").textContent = b.enabled ? "BEATS ON" : "BEATS";
+  for(const x of $("beats-mode").children) x.classList.toggle("active", x.dataset.bmode===b.mode);
+  const auto = b.mode==="auto";
+  const si=$("beats-int");
+  si.disabled = auto;                       // in AUTO the song drives it
+  const shown = auto ? (b.intensity||0) : (b.manual_intensity||0);
+  if(document.activeElement!==si) syncSlider(si, Math.round(shown*100));
+  $("beats-int-v").textContent = (auto?"~":"")+fmtv(shown);
+  const sl=$("beats-lvl");
+  const lvl = (b.level==null?0.55:b.level);
+  if(document.activeElement!==sl) syncSlider(sl, Math.round(lvl*100));
+  $("beats-lvl-v").textContent = fmtv(lvl);
+  // Style picker: the selected style lights up; in AUTO we also dimly outline
+  // the style the engine actually picked for the current vibe (style_eff).
+  const sel = b.style||"auto", eff = b.style_eff||sel;
+  for(const x of $("beats-styles").children){
+    const s = x.dataset.bstyle;
+    x.classList.toggle("active", s===sel);
+    x.classList.toggle("autopick", sel==="auto" && s===eff);
+  }
+}
+
+// ---- sound-FX rack ----------------------------------------------------
+// Paste a link → the server downloads + trims a one-shot on a worker thread;
+// the pad appears as LOADING then becomes a TRIGGER button. Tap to fire it over
+// the live mix; the × clears it. The FX fader sets the rack's master level.
+let _fxFire = {};                              // slot index -> ms to keep lit
+function fxAdd(){
+  const el = $("fx-url"), u = el.value.trim();
+  if(!u){ return; }
+  post({cmd:"fx_add_url", url:u});
+  el.value = "";
+}
+function fxTrigger(i){
+  _fxFire[i] = Date.now()+180;                 // flash the pad briefly
+  const pad = document.querySelector('.fx-pad[data-fi="'+i+'"]');
+  if(pad) pad.classList.add("firing");
+  post({cmd:"fx_trigger", value:i});
+}
+function renderFx(f){
+  const lvl = (f.level==null?0.8:f.level);
+  const sl = $("fx-lvl");
+  if(document.activeElement!==sl) syncSlider(sl, Math.round(lvl*100));
+  $("fx-lvl-v").textContent = fmtv(lvl);
+  const slots = f.slots||[];
+  const pads = $("fx-pads");
+  if(!slots.length){
+    pads.innerHTML = '<div class="fx-empty">no pads yet — paste a link above</div>';
+  } else {
+    const now = Date.now();
+    pads.innerHTML = slots.map((s,i)=>{
+      const ld = s.status==="loading";
+      const fire = (s.active || (_fxFire[i]||0)>now) ? " firing" : "";
+      const cls = ld ? "loading" : (s.status==="ready" ? "ready"+fire : "");
+      const tag = ld ? "LOAD…" : (s.dur?s.dur.toFixed(1)+"s":"");
+      const nm = (s.name||"clip").replace(/</g,"&lt;");
+      const onclk = ld ? "" : ' onclick="fxTrigger('+i+')"';
+      return '<div class="fx-pad '+cls+'" data-fi="'+i+'"'+onclk+'>'
+        + '<span class="fx-nm">'+nm+'</span>'
+        + '<span class="fx-dur">'+tag+'</span>'
+        + '<button class="fx-x" title="clear" onclick="event.stopPropagation();post({cmd:\'fx_clear\',value:'+i+'})">&times;</button>'
+        + '</div>';
+    }).join("");
+  }
+}
+
+// ---- MIDI melody layer ------------------------------------------------
+// Load a .mid (picked from the discovered list or a pasted path) and play it
+// through the synth voices, looped beat-locked + tempo-matched to the live deck.
+// SEMI transposes; MIX sets how loud the melody sits.
+let _mel = {};
+function renderMelody(m, files){
+  _mel = m||{};
+  $("mel-pad").classList.toggle("on", !!m.enabled);
+  $("mel-pad-txt").textContent = m.enabled ? "MELODY ON" : "MELODY";
+  $("mel-now").textContent = m.loaded
+    ? (m.name+" · "+m.notes+" notes · "+m.bars+" bar"+(m.bars===1?"":"s"))
+    : "no .mid loaded";
+  // Rebuild the file dropdown only when the file set changes, so an open menu
+  // or the DJ's current selection isn't clobbered every SSE frame.
+  const sig = (files||[]).map(f=>f.path).join("|");
+  const sel = $("mel-file");
+  if(sel.dataset.sig !== sig){
+    sel.dataset.sig = sig;
+    if(!files || !files.length){
+      sel.innerHTML = '<option value="">no .mid files found</option>';
+    } else {
+      sel.innerHTML = files.map(f=>'<option value="'+f.path.replace(/"/g,"&quot;")+'">'
+        + f.name.replace(/</g,"&lt;")+'</option>').join("");
+    }
+  }
+  const tr = m.transpose||0;
+  $("mel-tr").textContent = (tr>0?"+":"")+tr;
+  const sl = $("mel-lvl"), lvl = (m.level==null?0.6:m.level);
+  if(document.activeElement!==sl) syncSlider(sl, Math.round(lvl*100));
+  $("mel-lvl-v").textContent = fmtv(lvl);
+}
+function melLoad(){
+  const p = $("mel-file").value;
+  if(p) post({cmd:"melody_load", path:p});
+}
+function melLoadPath(){
+  const el = $("mel-path"), p = el.value.trim();
+  if(p){ post({cmd:"melody_load", path:p}); el.value=""; }
+}
+function melTrans(d){ post({cmd:"melody_transpose", value:(_mel.transpose||0)+d}); }
+
+// ---- monitor / headphone-cue (second audio output) --------------------
+// Mirror the engine's cue state into the panel: device dropdown (rebuilt only
+// when the device set changes, so an open menu / picked value isn't clobbered),
+// source toggle, level fader, and the AUDITION button + progress bar.
+function renderCue(c, devs){
+  const sig = devs.map(d=>d.index+":"+d.name).join("|");
+  if(sig !== cueDevSig){
+    cueDevSig = sig;
+    const sel=$("cue-dev");
+    const cur = sel.value;
+    sel.innerHTML = '<option value="off">— monitor off —</option>'
+      + devs.map(d=>'<option value="'+esc(d.name)+'">'+esc(d.name)+'</option>').join("");
+    // keep the current pick if it still exists
+    sel.value = cur;
+    if(sel.selectedIndex < 0) sel.value = "off";
+  }
+  // Reflect the engine's actual device (match by name substring) unless the
+  // menu is open / focused.
+  const sel=$("cue-dev");
+  if(document.activeElement!==sel){
+    let want="off";
+    if(c.device!=null && c.device!==""){
+      const needle=String(c.device).toLowerCase();
+      for(const o of sel.options){ if(o.value!=="off" && o.value.toLowerCase().indexOf(needle)>=0){ want=o.value; break; } }
+    }
+    sel.value = want;
+    if(sel.selectedIndex<0) sel.value="off";
+  }
+  // Source toggle
+  for(const b of $("cue-src").children) b.classList.toggle("active", b.dataset.src===c.source);
+  // Level
+  const lvl=$("cue-lvl");
+  if(document.activeElement!==lvl) syncSlider(lvl, Math.round((c.level==null?1:c.level)*100));
+  // State pill
+  const st=$("cue-state");
+  cueAud = !!c.auditioning;
+  if(cueAud){ st.textContent="AUDITION"; st.className="cue-state aud"; }
+  else if(c.enabled){ st.textContent="LIVE"; st.className="cue-state on"; }
+  else { st.textContent="OFF"; st.className="cue-state"; }
+  // Audition button — disabled unless a second output is actually open.
+  const ab=$("aud-btn"), at=$("aud-txt"), ap=$("aud-prog");
+  ab.disabled = !c.enabled;
+  ab.classList.toggle("live", cueAud);
+  at.textContent = cueAud ? "STOP AUDITION" : "AUDITION TRANSITION";
+  ap.style.width = (100*(cueAud ? (c.audition_progress||0) : 0))+"%";
+  $("cue-err").textContent = c.error || "";
+}
+function toggleAudition(){ post({cmd: cueAud ? "cue_audition_stop" : "cue_audition"}); }
 
 function setCrowdMode(manual){ send("crowd_manual", manual?1:0); }
 
@@ -1164,6 +1906,14 @@ function addUrl(){
   el.value=""; el.blur(); el.placeholder="queued — fetching in the background…";
   setTimeout(()=>{ el.placeholder="paste a YouTube link to queue it…"; }, 5000);
 }
+
+// ---- manual DJ queue ---------------------------------------------------
+// tid is id(track) as a string — sent back verbatim so the server matches by
+// identity (names collide; floats lose precision). queue_move value: -1 up, +1 down.
+function qadd(tid){ post({cmd:"queue_add", tid:tid}); }
+function qremove(tid){ post({cmd:"queue_remove", tid:tid}); }
+function qmove(tid,dir){ post({cmd:"queue_move", tid:tid, value:dir}); }
+function qclear(){ post({cmd:"queue_clear"}); }
 
 // ---- autopilot decision log -------------------------------------------
 function renderLog(items){
@@ -1189,6 +1939,15 @@ function renderLog(items){
 // advance the playhead in wall-clock time scaled by the deck's varispeed rate,
 // so the beat dots and playhead move at ~60fps instead of the 3Hz SSE rate.
 let anim={}, paused=false;
+// While the DJ is hand-dragging a deck's waveform or platter, freeze the
+// client-side playhead extrapolation for that deck so it tracks the finger
+// instead of running ahead on its own.
+let jogging={A:false, B:false};
+// While the DJ is dragging a cue flag, don't let the SSE frame snap it back to
+// the last server value (which lags the grab). Cleared on pointer release.
+let cueDrag={A:{in:false,out:false}, B:{in:false,out:false}};
+let cueAud=false;            // is the monitor currently auditioning a transition
+let cueDevSig="";            // signature of the device list, to avoid rebuilding
 function setAnim(p, d){
   anim[p] = {
     pos: d.position||0,
@@ -1208,7 +1967,7 @@ function pulse(){
     const dots=$(p+"-beats").children;
     if(!a){ requestAnimationFrame(pulse); return; }
     let local=a.pos;
-    if(a.playing && !paused) local += (now - a.tcap)/1000 * a.rate;
+    if(a.playing && !paused && !jogging[p]) local += (now - a.tcap)/1000 * a.rate;
     const frac = a.dur>0 ? Math.max(0,Math.min(1, local/a.dur)) : 0;
     $(p+"-head").style.left = (100*frac)+"%";
     updateWave(p+"-wave", frac);
@@ -1276,6 +2035,114 @@ let draggingXf=false;
     try{ rail.releasePointerCapture(ev.pointerId); }catch(_){} } };
   rail.addEventListener("pointerup", end);
   rail.addEventListener("pointercancel", end);
+})();
+
+// ---- waveform seek + jog-wheel scrub -----------------------------------
+// Make each deck hand-playable: drag the waveform to seek, or spin the platter
+// to scrub like vinyl. Both drive one backend `seek` (set deck position) and
+// pin the local animation to the drag point, so the playhead, waveform and disc
+// all follow the finger together. Backend pokes are throttled; the final
+// position is always flushed on release.
+(function(){
+  let seekT=0;
+  function poke(p, frac){                     // throttled engine seek (~25/s)
+    const now=performance.now();
+    if(now-seekT < 40) return;
+    seekT=now; post({cmd:"seek", deck:p, value:Math.max(0,Math.min(1,frac))});
+  }
+  function flush(p){                           // exact final position on release
+    const a=anim[p]; if(a && a.dur>0) post({cmd:"seek", deck:p, value:Math.max(0,Math.min(1,a.pos/a.dur))});
+  }
+  function setLocal(p, sec){                    // move the visual playhead now
+    const a=anim[p]; if(!a || !(a.dur>0)) return;
+    a.pos=Math.max(0,Math.min(a.dur, sec)); a.tcap=performance.now();
+  }
+  for(const p of ["A","B"]){
+    // -- waveform: click / drag to jump to that point in the track --
+    const wave=$(p+"-wave"), wrap=wave && wave.parentElement;
+    if(wrap){
+      let dragW=false;
+      const fracAt=ev=>{ const r=wrap.getBoundingClientRect();
+        return Math.max(0,Math.min(1,(ev.clientX-r.left)/r.width)); };
+      const go=ev=>{ const a=anim[p]; if(!a || !(a.dur>0)) return;
+        const f=fracAt(ev); setLocal(p, f*a.dur); poke(p, f); };
+      wrap.addEventListener("pointerdown", ev=>{ if(!(anim[p]&&anim[p].dur>0)) return;
+        dragW=true; jogging[p]=true; wrap.setPointerCapture(ev.pointerId); go(ev); ev.preventDefault(); });
+      wrap.addEventListener("pointermove", ev=>{ if(dragW) go(ev); });
+      const end=ev=>{ if(dragW){ dragW=false; jogging[p]=false; flush(p);
+        try{ wrap.releasePointerCapture(ev.pointerId); }catch(_){} } };
+      wrap.addEventListener("pointerup", end);
+      wrap.addEventListener("pointercancel", end);
+      wrap.style.cursor="pointer";
+    }
+    // -- platter: spin the disc to scrub (one full turn ~ one bar) --
+    const plat=$(p+"-platter");
+    if(plat){
+      let dragJ=false, lastA=0;
+      const ang=ev=>{ const r=plat.getBoundingClientRect();
+        return Math.atan2(ev.clientY-(r.top+r.height/2), ev.clientX-(r.left+r.width/2)); };
+      plat.addEventListener("pointerdown", ev=>{ const a=anim[p]; if(!a || !(a.dur>0)) return;
+        dragJ=true; jogging[p]=true; lastA=ang(ev); plat.setPointerCapture(ev.pointerId); ev.preventDefault(); });
+      plat.addEventListener("pointermove", ev=>{ if(!dragJ) return;
+        const a=anim[p]; if(!a || !(a.dur>0)) return;
+        let na=ang(ev), d=na-lastA;
+        if(d>Math.PI) d-=2*Math.PI; else if(d<-Math.PI) d+=2*Math.PI;
+        lastA=na;
+        const turn=4*(a.per>0?a.per:0.5);        // seconds per full disc turn (a bar)
+        setLocal(p, a.pos + (d/(2*Math.PI))*turn);
+        poke(p, a.pos/a.dur); });
+      const end=ev=>{ if(dragJ){ dragJ=false; jogging[p]=false; flush(p);
+        try{ plat.releasePointerCapture(ev.pointerId); }catch(_){} } };
+      plat.addEventListener("pointerup", end);
+      plat.addEventListener("pointercancel", end);
+      plat.style.cursor="grab";
+    }
+  }
+})();
+
+// ---- draggable transition cue points -----------------------------------
+// Drag the IN / OUT flags along a deck's waveform to hand-set the mix points
+// (in seconds = frac × track duration). Double-click a flag to clear it back to
+// the analysis default. Backend pokes are throttled; the final value is flushed
+// on release. We stopPropagation so the underlying waveform-seek doesn't fire.
+(function(){
+  let cueT=0;
+  function pokeCue(which, deck, sec){
+    const now=performance.now();
+    if(now-cueT < 45) return; cueT=now;
+    post({cmd: which==="in"?"set_mix_in":"set_mix_out", deck:deck, value:sec});
+  }
+  for(const p of ["A","B"]){
+    for(const which of ["in","out"]){
+      const el=$(p+"-cue-"+which), wrap=el && el.parentElement;
+      if(!el || !wrap) continue;
+      let drag=false;
+      const fracAt=ev=>{ const r=wrap.getBoundingClientRect();
+        return Math.max(0,Math.min(1,(ev.clientX-r.left)/r.width)); };
+      el.addEventListener("pointerdown", ev=>{
+        const a=anim[p]; if(!a || !(a.dur>0)) return;
+        drag=true; cueDrag[p][which]=true; el.setPointerCapture(ev.pointerId);
+        ev.preventDefault(); ev.stopPropagation();
+      });
+      el.addEventListener("pointermove", ev=>{ if(!drag) return;
+        const a=anim[p]; if(!a || !(a.dur>0)) return;
+        const f=fracAt(ev); el.style.left=(100*f)+"%"; pokeCue(which, p, f*a.dur);
+        ev.stopPropagation();
+      });
+      const end=ev=>{ if(!drag) return; drag=false; cueDrag[p][which]=false;
+        const a=anim[p];
+        if(a && a.dur>0){ const f=fracAt(ev);
+          post({cmd: which==="in"?"set_mix_in":"set_mix_out", deck:p, value:f*a.dur}); }
+        try{ el.releasePointerCapture(ev.pointerId); }catch(_){}
+        ev.stopPropagation();
+      };
+      el.addEventListener("pointerup", end);
+      el.addEventListener("pointercancel", end);
+      // double-click clears just this cue back to the analysis default
+      el.addEventListener("dblclick", ev=>{ ev.stopPropagation();
+        post({cmd: which==="in"?"set_mix_in":"set_mix_out", deck:p, value:-1}); });
+    }
+  }
 })();
 
 // Vibe fader: when manual is engaged, drag the CROWD meter to dictate the room.

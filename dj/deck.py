@@ -27,6 +27,14 @@ class Deck:
         self.bend = 0.0         # manual pitch-fader offset (fraction, ±), DJ-driven
         self.gain = 0.0         # linear gain applied by the mixer
         self.playing = False
+        # DJ overrides for the phrase-aligned mix cues (seconds). None = use the
+        # analysis defaults; set by the dashboard's draggable cue markers so the
+        # operator can hand-tune where the incoming track drops (mix_in) and where
+        # the outgoing one starts its fade (mix_out). The live transition AND the
+        # headphone-cue audition both read these, so what you align by ear is what
+        # actually fires.
+        self.mix_in_override: float | None = None
+        self.mix_out_override: float | None = None
 
     def load(self, samples: np.ndarray, analysis: Analysis, title: str) -> None:
         with self._lock:
@@ -38,6 +46,23 @@ class Deck:
             self.bend = 0.0
             self.gain = 0.0
             self.playing = False
+            # A fresh track gets fresh cues: drop any hand-tuned overrides from
+            # the track that was here before.
+            self.mix_in_override = None
+            self.mix_out_override = None
+
+    def seek_fraction(self, frac: float) -> None:
+        """Jump the playhead to a fraction (0..1) of the track. Drives the
+        dashboard's waveform-seek and jog-wheel scrub. Resumes playback if the
+        deck is audible (seeking the live track keeps it playing); a silent cued
+        deck just repositions without starting."""
+        with self._lock:
+            n = len(self.samples)
+            if n <= 1:
+                return
+            self.pos = float(min(1.0, max(0.0, frac))) * (n - 1)
+            if self.gain > 0.0 or self.playing:
+                self.playing = self.pos < n - 1
 
     @property
     def eff_rate(self) -> float:
@@ -54,6 +79,21 @@ class Deck:
     @property
     def position_sec(self) -> float:
         return self.pos / SAMPLE_RATE
+
+    # ---- cue points ------------------------------------------------------
+    def eff_mix_in(self) -> float:
+        """Seconds at which to bring this track IN — the DJ's hand-set marker if
+        there is one, else the phrase-aligned analysis default."""
+        if self.mix_in_override is not None:
+            return self.mix_in_override
+        return self.analysis.mix_in_sec() if self.analysis else 0.0
+
+    def eff_mix_out(self) -> float:
+        """Seconds at which to start mixing this track OUT — DJ override if set,
+        else the analysis default (which is the duration when no outro found)."""
+        if self.mix_out_override is not None:
+            return self.mix_out_override
+        return self.analysis.mix_out_sec() if self.analysis else 0.0
 
     @property
     def remaining_sec(self) -> float:
@@ -94,3 +134,25 @@ class Deck:
             if self.pos >= length - 1:
                 self.playing = False
             return out
+
+    def read_preview(self, pos: float, n: int, rate: float) -> tuple[np.ndarray, float]:
+        """Read `n` frames starting at fractional index `pos` at the given rate,
+        WITHOUT touching the deck's live playhead/gain/playing state. Used by the
+        headphone-cue engine (a second output device) to monitor or audition a
+        deck independently of what's going to the speakers. Returns the audio plus
+        the next position so the caller can carry its own preview playhead."""
+        out = np.zeros((n, CHANNELS), dtype=np.float32)
+        r = rate if rate > 0 else 1e-6
+        with self._lock:
+            samples = self.samples
+            length = len(samples)
+            if length == 0:
+                return out, pos
+            positions = pos + np.arange(n) * r
+            idx0 = np.floor(positions).astype(np.int64)
+            frac = (positions - idx0).astype(np.float32)[:, None]
+            valid = (idx0 >= 0) & (idx0 < length - 1)
+            if valid.any():
+                i0 = idx0[valid]
+                out[valid] = samples[i0] * (1.0 - frac[valid]) + samples[i0 + 1] * frac[valid]
+        return out, pos + n * r

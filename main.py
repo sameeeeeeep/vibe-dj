@@ -37,6 +37,12 @@ def main() -> int:
     ap.add_argument("--simulate-crowd", action="store_true", help="fake the crowd signal (no webcam)")
     ap.add_argument("--camera", type=int, default=0, help="webcam index (default 0)")
     ap.add_argument("--dry-run", action="store_true", help="no audio device; just run the loop")
+    ap.add_argument("--cue-device", default=None,
+                    help="second output for the headphone cue/monitor (device index or name "
+                         "substring, e.g. 'AirPods'); can also be picked in the dashboard")
+    ap.add_argument("--master-device", default=None,
+                    help="pin the master (room) output to a device (index or name substring, "
+                         "e.g. 'Speakers') so it won't follow the system default onto AirPods")
     ap.add_argument("--dashboard", action="store_true", help="serve the live web dashboard")
     ap.add_argument("--port", type=int, default=8765, help="dashboard port (default 8765)")
     ap.add_argument("--crossfade", type=float, default=12.0, help="crossfade length, seconds")
@@ -75,7 +81,8 @@ def main() -> int:
     print(f"Tracks ready: {len(tracks)}  "
           f"BPM {min(t.bpm for t in tracks):.0f}-{max(t.bpm for t in tracks):.0f}")
 
-    mixer = Mixer(dry_run=args.dry_run)
+    mixer = Mixer(dry_run=args.dry_run, cue_device=args.cue_device,
+                  master_device=args.master_device)
     crowd = CrowdSensor(simulate=args.simulate_crowd, camera=args.camera).start()
     controller = Controller(
         library, mixer, crowd,
