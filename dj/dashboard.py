@@ -9,8 +9,11 @@ Endpoints:
     GET  /            the single-page dashboard
     GET  /events      SSE stream of engine snapshots (~3 Hz)
     GET  /frame.jpg   latest crowd-cam frame (204 when simulated / no camera)
-    POST /control     {"cmd": "skip" | "force" | "nudge" | "crowd_manual"
-                              | "crowd_set", "delta": <float>}
+    POST /control     {"cmd": ..., "deck": "A"|"B", "band": "low"|"mid"|"high",
+                       "value": <float>, "url": <str>}
+                      cmds: skip | force | cue | pause | nudge | crowd_manual |
+                            crowd_set | eq | eq_kill | trim | bend | xfade |
+                            add_url
 """
 
 from __future__ import annotations
@@ -57,17 +60,34 @@ class Dashboard:
             role = "cued"
         else:
             role = "idle"
+        an = d.analysis
+        eqm = self.mixer.eq_manual[name]
         return {
             "role": role,
-            "title": d.title or (track.name if track else ""),
-            "base_bpm": round(d.analysis.bpm, 1) if d.analysis else 0.0,
+            # A freed deck keeps its old Deck.title; only surface a title when a
+            # track is actually loaded so an idle deck reads clean, not stale.
+            "title": (d.title or (track.name if track else "")) if loaded else "",
+            "base_bpm": round(an.bpm, 1) if an else 0.0,
             "bpm": round(d.effective_bpm, 1),
             "energy": round(track.energy, 3) if track else None,
             "gain": round(d.gain, 3),
             "playing": d.playing,
-            "position": round(d.position_sec, 1),
-            "duration": round(d.analysis.duration, 1) if d.analysis else 0.0,
+            "position": round(d.position_sec, 2),
+            "duration": round(an.duration, 1) if an else 0.0,
             "remaining": round(d.remaining_sec, 1),
+            # manual deck controls (DJ-driven)
+            "bend": round(d.bend, 4),
+            "trim": round(self.mixer.trim[name], 3),
+            "eq": {"low": round(eqm[0], 3), "mid": round(eqm[1], 3), "high": round(eqm[2], 3)},
+            "bass_auto": round(self.mixer.bass_auto[name], 3),
+            # beat grid + phrase cues, for the live pulse and cue markers
+            "beat_offset": round(an.beat_offset, 4) if an else 0.0,
+            "beat_period": round(an.beat_period, 4) if an else 0.0,
+            "phrase_period": round(an.phrase_period, 4) if an else 0.0,
+            "mix_in": round(an.mix_in_sec(), 2) if an else 0.0,
+            "mix_out": round(an.mix_out_sec(), 2) if an else 0.0,
+            "intro_end": round(an.intro_end, 2) if an else 0.0,
+            "outro_start": round(an.outro_start, 2) if an else 0.0,
         }
 
     def _buffer_info(self) -> list[dict]:
@@ -86,6 +106,7 @@ class Dashboard:
     def snapshot(self) -> dict:
         return {
             "live": self.mixer.current,
+            "paused": self.mixer.paused,
             "transition": self.mixer.transition_state(),
             "decks": {"A": self._deck_info("A"), "B": self._deck_info("B")},
             "crowd": {
@@ -98,19 +119,67 @@ class Dashboard:
             "target_energy": round(self.controller.current_target(), 3),
             "energy_bias": round(self.controller.energy_bias, 3),
             "buffer": self._buffer_info(),
+            "log": [{"t": t, "m": m} for (t, m) in self.controller.recent_events(14)],
         }
 
-    def handle_command(self, cmd: str, delta: float = 0.0) -> None:
+    def handle_command(self, payload: dict) -> None:
+        cmd = str(payload.get("cmd", ""))
+        deck = str(payload.get("deck", ""))
+        band = str(payload.get("band", ""))
+        try:
+            value = float(payload.get("value", payload.get("delta", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
         if cmd == "skip":
             self.controller.request_skip()
         elif cmd == "force":
             self.controller.request_transition()
+        elif cmd == "cue":
+            self.controller.request_cue()
+        elif cmd == "pause":
+            self.mixer.toggle_pause()
         elif cmd == "nudge":
-            self.controller.nudge_energy(delta)
+            self.controller.nudge_energy(value)
         elif cmd == "crowd_manual":
-            self.controller.set_crowd_manual(delta >= 0.5)
+            self.controller.set_crowd_manual(value >= 0.5)
         elif cmd == "crowd_set":
-            self.controller.set_crowd_energy(delta)
+            self.controller.set_crowd_energy(value)
+        elif cmd == "eq":
+            self.mixer.set_eq(deck, band, value)
+        elif cmd == "eq_kill":
+            self.mixer.toggle_kill(deck, band)
+        elif cmd == "trim":
+            self.mixer.set_trim(deck, value)
+        elif cmd == "bend":
+            self.mixer.set_bend(deck, value)
+        elif cmd == "xfade":
+            self.mixer.scrub_crossfade(value)
+        elif cmd == "add_url":
+            url = str(payload.get("url", "")).strip()
+            if url.startswith(("http://", "https://")):
+                self._enqueue_url(url)
+            else:
+                self.controller.log("[add]   ignored (need an http(s) link)")
+
+    def _enqueue_url(self, url: str) -> None:
+        """Fetch + analyse a pasted URL on a worker thread so the POST returns
+        at once and the engine keeps playing; the new track surfaces in the
+        buffer/up-next and becomes a pick candidate when it's ready."""
+        def work() -> None:
+            log = self.controller.log
+            if not hasattr(self.library, "add_url"):
+                log("[add]   this source can't take URLs")
+                return
+            log(f"[add]   fetching {url} …")
+            try:
+                added = self.library.add_url(url, log=log)
+            except Exception as exc:  # noqa: BLE001 - surface, don't crash the server
+                log(f"[add]   failed: {exc}")
+                return
+            for t in (added or []):
+                log(f"[add]   ready {t.name}  {t.bpm:.0f} BPM  energy {t.energy:.2f}")
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ---- server ----------------------------------------------------------
     def start(self) -> "Dashboard":
@@ -156,8 +225,9 @@ class Dashboard:
                 raw = self.rfile.read(length) if length else b"{}"
                 try:
                     payload = json.loads(raw or b"{}")
-                    dashboard.handle_command(str(payload.get("cmd", "")),
-                                             float(payload.get("delta", 0.0)))
+                    if not isinstance(payload, dict):
+                        raise ValueError("payload must be an object")
+                    dashboard.handle_command(payload)
                     ok = True
                 except (ValueError, TypeError):
                     ok = False
@@ -238,9 +308,9 @@ PAGE = r"""<!doctype html>
   .dot-ok{background:var(--ok);} .dot-live{background:var(--danger);} .dot-faint{background:var(--tf);}
 
   /* decks row */
-  .decks{display:flex;gap:16px;height:440px;}
+  .decks{display:flex;gap:16px;align-items:stretch;}
   .deck{flex:1;min-width:0;background:var(--bg-panel);border-radius:18px;padding:24px;
-    display:flex;flex-direction:column;justify-content:space-between;}
+    display:flex;flex-direction:column;gap:16px;}
   .deck.a{border:1px solid var(--deck-a-dim);}
   .deck.b{border:1px solid var(--deck-b-dim);}
   .deck-head{display:flex;align-items:center;justify-content:space-between;}
@@ -343,6 +413,7 @@ PAGE = r"""<!doctype html>
     border-radius:18px;padding:20px;display:flex;flex-direction:column;justify-content:space-between;gap:14px;}
   .ctl-head{display:flex;align-items:center;justify-content:space-between;}
   .ctl-title{font-family:var(--f-mono);font-size:10px;letter-spacing:.14em;color:var(--td);}
+  .ctl-hint{font-family:var(--f-body);font-size:11px;line-height:1.5;color:var(--tf);}
   .auto-pill{display:flex;align-items:center;gap:6px;font-family:var(--f-mono);font-size:9px;
     letter-spacing:.1em;color:var(--ok);background:#0F2018;border:1px solid #1C3A2B;
     border-radius:6px;padding:5px 9px;}
@@ -380,6 +451,16 @@ PAGE = r"""<!doctype html>
     font-size:14px;letter-spacing:.1em;}
   .up-head-l svg{color:var(--td);}
   .up-head-r{font-family:var(--f-mono);font-size:10px;letter-spacing:.1em;color:var(--tf);}
+  .up-add{display:flex;align-items:center;gap:10px;}
+  .add-input{width:248px;background:var(--bg-inset);border:1px solid var(--border);border-radius:8px;
+    color:var(--tp);font-family:var(--f-mono);font-size:11px;letter-spacing:.03em;padding:8px 11px;outline:none;
+    transition:border-color .15s;}
+  .add-input:focus{border-color:var(--deck-a);}
+  .add-input::placeholder{color:var(--tf);}
+  .add-btn{font-family:var(--f-disp);font-weight:600;font-size:11px;letter-spacing:.08em;cursor:pointer;
+    color:var(--deck-a);background:#0C2630;border:1px solid var(--deck-a-dim);border-radius:8px;padding:8px 13px;
+    transition:border-color .15s,transform .05s;}
+  .add-btn:hover{border-color:var(--deck-a);} .add-btn:active{transform:translateY(1px);}
   .cards{display:flex;gap:12px;}
   .card{flex:1;min-width:0;display:flex;flex-direction:column;gap:12px;padding:14px;border-radius:12px;
     background:var(--bg-raised);border:1px solid var(--border);}
@@ -402,9 +483,86 @@ PAGE = r"""<!doctype html>
   .cdot{width:8px;height:8px;border-radius:50%;}
   .card-empty{color:var(--td);font-family:var(--f-mono);font-size:12px;padding:8px;}
 
+  /* master transport (topbar play/pause) */
+  .transport{display:flex;align-items:center;gap:8px;background:var(--ok);color:#04140C;border:none;
+    border-radius:9px;padding:9px 15px;font-family:var(--f-disp);font-weight:700;font-size:13px;
+    letter-spacing:.08em;cursor:pointer;transition:transform .05s,filter .15s;}
+  .transport:hover{filter:brightness(1.08);} .transport:active{transform:translateY(1px);}
+  .transport.paused{background:var(--warn);color:#1A0F00;}
+  .transport .pp-ic{font-size:13px;line-height:1;}
+
+  /* live beat + phrase pulse */
+  .beatline{display:flex;align-items:center;justify-content:space-between;}
+  .beats{display:flex;gap:7px;}
+  .beats span{width:13px;height:13px;border-radius:50%;background:currentColor;opacity:.12;
+    transition:opacity .04s linear;}
+  .deck.a .beats{color:var(--deck-a);} .deck.b .beats{color:var(--deck-b);}
+  .beats span.hit{box-shadow:0 0 11px currentColor;}
+  .phrasetxt{font-family:var(--f-mono);font-size:10px;letter-spacing:.12em;color:var(--td);}
+
+  /* waveform overlay: phrase cue markers + moving playhead */
+  .wavewrap{position:relative;}
+  .cue{position:absolute;top:-5px;bottom:-5px;width:2px;z-index:2;pointer-events:none;display:none;}
+  .cue-in{background:var(--ok);box-shadow:0 0 6px var(--ok);}
+  .cue-out{background:var(--danger);box-shadow:0 0 6px var(--danger);}
+  .cue::before{content:"";position:absolute;top:-4px;left:-2px;width:6px;height:6px;border-radius:1px;background:inherit;}
+  .playhead{position:absolute;top:-5px;bottom:-5px;left:0;width:2px;background:var(--tp);z-index:3;
+    pointer-events:none;box-shadow:0 0 7px #fff9;}
+
+  /* per-deck control strip: 3-band EQ + volume + pitch */
+  .strip{display:flex;gap:16px;align-items:flex-start;justify-content:space-between;
+    padding-top:14px;margin-top:4px;border-top:1px solid var(--border-soft);}
+  .eq{display:flex;gap:13px;}
+  .eqband,.chan{display:flex;flex-direction:column;align-items:center;gap:9px;}
+  .strip-lab{font-family:var(--f-mono);font-size:9px;letter-spacing:.12em;color:var(--td);}
+  .killbtn{font-family:var(--f-mono);font-size:9px;letter-spacing:.1em;color:var(--td);background:var(--bg-inset);
+    border:1px solid var(--border);border-radius:5px;padding:5px 0;width:46px;cursor:pointer;transition:.15s;}
+  .killbtn:hover{color:var(--tp);border-color:var(--td);}
+  .killbtn.killed{color:var(--danger);border-color:var(--danger);background:#2A0E18;}
+  .pitch-v{font-family:var(--f-num);font-size:11px;font-weight:600;color:var(--tp);min-height:14px;}
+  .vrange{-webkit-appearance:none;appearance:none;writing-mode:vertical-lr;direction:rtl;
+    width:10px;height:100px;background:var(--bg-inset);border-radius:6px;border:1px solid var(--border);
+    cursor:pointer;margin:0;}
+  .vrange::-webkit-slider-thumb{-webkit-appearance:none;width:26px;height:11px;border-radius:3px;
+    background:var(--tp);box-shadow:0 0 6px #000a;border:1px solid #0008;}
+  .vrange::-moz-range-thumb{width:26px;height:11px;border:none;border-radius:3px;background:var(--tp);}
+  .deck.a .vrange::-webkit-slider-thumb{background:var(--deck-a);}
+  .deck.b .vrange::-webkit-slider-thumb{background:var(--deck-b);}
+  .deck.a .vrange::-moz-range-thumb{background:var(--deck-a);}
+  .deck.b .vrange::-moz-range-thumb{background:var(--deck-b);}
+  .vrange.pitch::-webkit-slider-thumb{background:var(--accent);}
+  .vrange.pitch::-moz-range-thumb{background:var(--accent);}
+
+  /* crossfader scrub + bass-swap meter (in the center column) */
+  .xf-rail{cursor:ns-resize;}
+  .bass-swap{width:100%;display:flex;flex-direction:column;gap:6px;}
+  .bs-lab{font-family:var(--f-mono);font-size:9px;letter-spacing:.12em;color:var(--tf);text-align:center;}
+  .bs-row{display:flex;align-items:center;gap:7px;}
+  .bs-tag{font-family:var(--f-disp);font-weight:700;font-size:11px;width:9px;}
+  .bs-tag.a{color:var(--deck-a);} .bs-tag.b{color:var(--deck-b);}
+  .bs-bar{flex:1;height:8px;background:var(--bg-inset);border-radius:4px;overflow:hidden;
+    border:1px solid var(--border-soft);}
+  .bs-fill{height:100%;border-radius:4px;transition:width .1s linear;}
+  .bs-fill.a{background:var(--deck-a);} .bs-fill.b{background:var(--deck-b);}
+
+  /* autopilot decision log */
+  .logpanel{background:var(--bg-panel);border:1px solid var(--border);border-radius:18px;
+    padding:18px 20px;display:flex;flex-direction:column;gap:12px;}
+  .log-head{display:flex;align-items:center;justify-content:space-between;font-family:var(--f-mono);
+    font-size:10px;letter-spacing:.14em;color:var(--td);}
+  .log-body{display:flex;flex-direction:column;gap:7px;font-family:var(--f-mono);font-size:11px;
+    max-height:150px;overflow:hidden;}
+  .log-line{display:flex;gap:10px;align-items:baseline;}
+  .log-t{color:var(--tf);font-size:9px;flex:none;}
+  .log-m{color:var(--td);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .log-line.mix .log-m{color:var(--accent);}
+  .log-line.cue .log-m{color:var(--deck-a);}
+  .log-line.start .log-m,.log-line.live .log-m{color:var(--ok);}
+
   @media (max-width:1120px){
     .decks{flex-direction:column;height:auto;}
-    .xfader{width:auto;min-height:160px;}
+    .deck{min-height:480px;}
+    .xfader{width:auto;min-height:200px;}
     .midrow{flex-direction:column;height:auto;}
     .crowd{flex-direction:column;}
     .cam{width:auto;height:160px;}
@@ -412,6 +570,105 @@ PAGE = r"""<!doctype html>
   }
   @media (max-width:700px){
     .cards{flex-wrap:wrap;} .card{flex:1 1 140px;}
+  }
+
+  /* ===================================================================== */
+  /* HARDWARE CONSOLE: jog decks + center mixer (overrides the panels above) */
+  /* ===================================================================== */
+  .console{display:grid;grid-template-columns:minmax(0,1fr) 392px minmax(0,1fr);
+    background:linear-gradient(180deg,#0e1116,#080a0d);border:1px solid #20262f;border-radius:20px;
+    box-shadow:inset 0 1px 0 #ffffff0a, 0 12px 44px #0009;overflow:hidden;}
+  .console .deck{background:transparent;border:none;border-radius:0;padding:22px 24px;gap:13px;}
+  .console .deck.a{border-right:1px solid #1b212a;}
+  .console .deck.b{border-left:1px solid #1b212a;}
+  .console .mixer{background:linear-gradient(180deg,#0b0d11,#060708);padding:20px 18px;
+    display:flex;flex-direction:column;gap:15px;}
+  .console .wave{height:44px;}
+
+  .deck-top{display:flex;align-items:center;justify-content:space-between;}
+  .deck-leds{display:flex;gap:7px;}
+  .led{font-family:var(--f-mono);font-size:9px;letter-spacing:.12em;padding:4px 8px;border-radius:5px;
+    border:1px solid var(--border);color:var(--tf);background:var(--bg-inset);transition:.15s;}
+  .led.sync.on{color:var(--ok);border-color:#1C3A2B;background:#0F2018;box-shadow:0 0 9px #3dd68c4d;}
+  .led.play.on{color:var(--deck-a);border-color:var(--deck-a-dim);background:#0C2630;box-shadow:0 0 9px #27c3f24d;}
+  .deck.b .led.play.on{color:var(--deck-b);border-color:var(--deck-b-dim);background:#261A0C;box-shadow:0 0 9px #ff8a1e4d;}
+
+  /* jog wheel + pitch fader */
+  .jog-row{display:flex;align-items:center;gap:16px;justify-content:center;padding:4px 0;}
+  .deck.b .jog-row{flex-direction:row-reverse;}
+  .pitch-col{display:flex;flex-direction:column;align-items:center;gap:8px;}
+  .pitch-col .vrange{height:150px;}
+  .jog{position:relative;width:218px;height:218px;flex:none;}
+  .jog-ring{position:absolute;inset:0;width:100%;height:100%;transform:rotate(-90deg);}
+  .jog-ring .ring-bg{fill:none;stroke:#171b21;stroke-width:3.5;}
+  .jog-ring .ring-fg{fill:none;stroke:var(--deck-a);stroke-width:3.5;stroke-linecap:round;}
+  .deck.b .jog-ring .ring-fg{stroke:var(--deck-b);}
+  .jog-platter{position:absolute;inset:12px;border-radius:50%;will-change:transform;
+    background:repeating-conic-gradient(from 0deg,#1d2128 0deg 7.5deg,#262b34 7.5deg 15deg),
+      radial-gradient(circle at 50% 36%,#3a414b,#20242b 56%,#0c0e12 100%);
+    background-blend-mode:soft-light,normal;
+    box-shadow:inset 0 3px 9px #0009,inset 0 -4px 13px #000,0 7px 20px #000a;border:1px solid #2b313a;}
+  .jog-platter::after{content:"";position:absolute;inset:33%;border-radius:50%;
+    background:radial-gradient(circle at 50% 36%,#484e58,#191d23 72%);
+    box-shadow:inset 0 1px 3px #0008,0 1px 2px #000;}
+  .jog-mark{position:absolute;left:50%;top:5.5%;width:4px;height:21%;margin-left:-2px;border-radius:2px;
+    background:var(--deck-a);box-shadow:0 0 11px var(--deck-a);}
+  .deck.b .jog-mark{background:var(--deck-b);box-shadow:0 0 11px var(--deck-b);}
+  .jog-center{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;pointer-events:none;gap:1px;}
+  .jog-pos{font-family:var(--f-num);font-weight:700;font-size:30px;color:var(--tp);line-height:1;}
+  .jog-rem{font-family:var(--f-mono);font-size:10px;letter-spacing:.08em;color:var(--td);}
+
+  /* center mixer */
+  .mx-head{display:flex;align-items:center;justify-content:space-between;}
+  .mx-title{font-family:var(--f-disp);font-weight:700;font-size:13px;letter-spacing:.16em;color:var(--td);}
+  .mx-strips{display:grid;grid-template-columns:1fr auto 1fr;gap:12px;align-items:stretch;}
+  .mx-ch{display:flex;flex-direction:column;align-items:center;gap:12px;
+    background:#0c0f13;border:1px solid #1a1f27;border-radius:12px;padding:13px 9px;}
+  .ch-lab{font-family:var(--f-mono);font-size:10px;letter-spacing:.14em;}
+  .mx-ch.a .ch-lab{color:var(--deck-a);} .mx-ch.b .ch-lab{color:var(--deck-b);}
+  .knobs{display:flex;flex-direction:column;gap:11px;width:100%;}
+  .knob-cell{display:flex;align-items:center;justify-content:center;gap:8px;}
+  .knob{width:42px;height:42px;flex:none;border-radius:50%;cursor:ns-resize;touch-action:none;position:relative;
+    background:radial-gradient(circle at 50% 30%,#333a45,#171b21 72%);
+    border:1px solid #2d333d;box-shadow:inset 0 1px 2px #0008,0 2px 5px #0009;}
+  .knob-dial{position:absolute;inset:0;border-radius:50%;transition:transform .08s ease-out;}
+  .knob-ind{position:absolute;left:50%;top:3px;width:3px;height:14px;margin-left:-1.5px;border-radius:2px;
+    background:var(--deck-a);box-shadow:0 0 5px var(--deck-a);}
+  .mx-ch.b .knob-ind{background:var(--deck-b);box-shadow:0 0 5px var(--deck-b);}
+  .knob.killed{box-shadow:inset 0 0 0 1.5px var(--danger),inset 0 1px 2px #0008;}
+  .knob.killed .knob-ind{background:var(--danger);box-shadow:0 0 7px var(--danger);}
+  .knob-cell .killbtn{width:42px;}
+  .fader-cell{display:flex;align-items:flex-end;gap:9px;height:150px;padding-top:2px;}
+  .fader-cell .vrange{height:150px;}
+  .chmeter{width:7px;height:100%;border-radius:4px;background:#070809;border:1px solid #1a1f27;
+    overflow:hidden;display:flex;align-items:flex-end;}
+  .chmeter-fill{width:100%;height:0%;border-radius:4px 4px 0 0;
+    background:linear-gradient(0deg,#3DD68C,#84CC16 55%,#F59E0B 80%,#FF2D6E);transition:height .1s linear;}
+  .mx-center{display:flex;flex-direction:column;justify-content:center;gap:12px;min-width:92px;}
+
+  .xfader-h{display:flex;align-items:center;gap:12px;padding:9px 8px;
+    background:#0c0f13;border:1px solid #1a1f27;border-radius:12px;}
+  .xfader-h .xf-end{font-family:var(--f-disp);font-weight:700;font-size:14px;}
+  .xf-rail-h{position:relative;flex:1;height:10px;border-radius:5px;cursor:ew-resize;touch-action:none;
+    background:linear-gradient(90deg,var(--deck-a),#15181d 50%,var(--deck-b));box-shadow:inset 0 1px 3px #000a;}
+  .xf-knob-h{position:absolute;top:50%;left:50%;width:26px;height:34px;border-radius:5px;
+    transform:translate(-50%,-50%);background:linear-gradient(#eef2f7,#aab2bf);
+    box-shadow:0 3px 8px #000b,inset 0 1px 0 #fff,inset 0 -2px 3px #0003;border:1px solid #0006;transition:left .12s;}
+  .xfader-h.mixing .xf-knob-h{background:linear-gradient(#cdbcff,#8b6cf0);}
+
+  .mx-transport{display:flex;gap:9px;}
+  .mx-btn{flex:1;padding:11px 0;border-radius:10px;background:var(--bg-raised);border:1px solid var(--border);
+    color:var(--tp);font-family:var(--f-disp);font-weight:600;font-size:12px;letter-spacing:.07em;cursor:pointer;
+    transition:border-color .15s,transform .05s;}
+  .mx-btn:hover{border-color:var(--td);} .mx-btn:active{transform:translateY(1px);}
+  .mx-btn.cue{color:var(--deck-a);border-color:var(--deck-a-dim);background:#0C2630;}
+  .mx-btn.skip{color:var(--ok);border-color:#1C3A2B;background:#0F2018;}
+  .mx-btn.force{color:var(--accent);border-color:#2E2547;background:#16121F;}
+
+  @media (max-width:1120px){
+    .console{grid-template-columns:1fr;}
+    .console .deck.a,.console .deck.b{border:none;border-bottom:1px solid #1b212a;}
   }
 </style>
 </head>
@@ -427,51 +684,160 @@ PAGE = r"""<!doctype html>
     <div class="topstats">
       <div class="tstat"><span class="tstat-l">SET TIME</span><span class="tstat-v" id="set-time">0:00:00</span></div>
       <div class="tstat"><span class="tstat-l">IN ROTATION</span><span class="tstat-v" id="rotation">0 TRACKS</span></div>
+      <button class="transport" id="playpause" onclick="send('pause')">
+        <span class="pp-ic" id="pp-ic">&#9208;</span><span id="pp-txt">PAUSE</span></button>
       <div class="live-pill" id="live-pill"><span class="dot" id="live-dot"></span><span id="live-txt">CONNECTING</span></div>
     </div>
   </div>
 
-  <div class="decks">
+  <div class="console">
     <div class="deck a" id="deckA">
-      <div class="deck-head">
+      <div class="deck-top">
         <div class="chips"><span class="chip-deck">DECK A</span><span class="status" id="A-status">IDLE</span></div>
-        <span class="deck-ch">A</span>
+        <div class="deck-leds">
+          <span class="led sync" id="A-sync-led">SYNC</span>
+          <span class="led play" id="A-play-led">PLAY</span>
+        </div>
       </div>
       <div class="deck-title"><div class="t-name" id="A-title">&mdash;</div><div class="t-art" id="A-art"></div></div>
       <div class="bpm-row">
         <div class="bpm"><span class="bpm-v" id="A-bpm">0.0</span><span class="bpm-u">BPM</span></div>
         <div class="bm-side"><span class="bm-pill" id="A-bm">&bull; 0.0%</span><span class="bm-orig" id="A-orig"></span></div>
       </div>
-      <div class="wave" id="A-wave"></div>
+      <div class="beatline">
+        <div class="beats" id="A-beats"><span></span><span></span><span></span><span></span></div>
+        <span class="phrasetxt" id="A-phrase">&mdash;</span>
+      </div>
+      <div class="wavewrap">
+        <div class="wave" id="A-wave"></div>
+        <div class="cue cue-in" id="A-cue-in"></div>
+        <div class="cue cue-out" id="A-cue-out"></div>
+        <div class="playhead" id="A-head"></div>
+      </div>
       <div class="deck-foot"><span id="A-pos">0:00</span><span class="foot-mid" id="A-mid"></span><span id="A-dur">0:00</span></div>
+      <div class="jog-row">
+        <div class="pitch-col">
+          <input class="vrange pitch" id="A-pitch" type="range" min="-80" max="80" value="0"
+                 oninput="setPitch('A',this.value)">
+          <span class="pitch-v" id="A-pitch-v">+0.0%</span>
+          <span class="strip-lab">PITCH</span>
+        </div>
+        <div class="jog">
+          <svg class="jog-ring" viewBox="0 0 100 100">
+            <circle class="ring-bg" cx="50" cy="50" r="47"></circle>
+            <circle class="ring-fg" id="A-ring" cx="50" cy="50" r="47"></circle>
+          </svg>
+          <div class="jog-platter" id="A-platter"><div class="jog-mark"></div></div>
+          <div class="jog-center">
+            <span class="jog-pos" id="A-jog-pos">0:00</span>
+            <span class="jog-rem" id="A-jog-rem">-0:00</span>
+          </div>
+        </div>
+      </div>
     </div>
 
-    <div class="xfader" id="xfader">
-      <div class="xf-label">CROSSFADE</div>
-      <div class="xf-track">
+    <div class="mixer">
+      <div class="mx-head">
+        <span class="mx-title">MIXER</span>
+        <span class="sync-pill" id="sync-pill">SYNC 0.0</span>
+      </div>
+      <div class="mx-strips">
+        <div class="mx-ch a">
+          <span class="ch-lab">CH A</span>
+          <div class="knobs">
+            <div class="knob-cell"><div class="knob" id="A-eq-high" data-deck="A" data-band="high"></div><button class="killbtn" id="A-kill-high" onclick="killEq('A','high')">HIGH</button></div>
+            <div class="knob-cell"><div class="knob" id="A-eq-mid" data-deck="A" data-band="mid"></div><button class="killbtn" id="A-kill-mid" onclick="killEq('A','mid')">MID</button></div>
+            <div class="knob-cell"><div class="knob" id="A-eq-low" data-deck="A" data-band="low"></div><button class="killbtn" id="A-kill-low" onclick="killEq('A','low')">LOW</button></div>
+          </div>
+          <div class="fader-cell">
+            <div class="chmeter"><div class="chmeter-fill" id="A-chmeter"></div></div>
+            <input class="vrange" id="A-vol" type="range" min="0" max="100" value="100"
+                   oninput="post({cmd:'trim',deck:'A',value:this.value/100})">
+          </div>
+          <span class="strip-lab">VOL A</span>
+        </div>
+
+        <div class="mx-center">
+          <div class="bass-swap">
+            <div class="bs-lab">BASS SWAP</div>
+            <div class="bs-row"><span class="bs-tag a">A</span><div class="bs-bar"><div class="bs-fill a" id="bs-A"></div></div></div>
+            <div class="bs-row"><span class="bs-tag b">B</span><div class="bs-bar"><div class="bs-fill b" id="bs-B"></div></div></div>
+          </div>
+          <div class="xf-next"><span class="xf-next-l" id="xf-next-l">NEXT MIX</span><span class="xf-next-v" id="xf-next">0:00</span></div>
+        </div>
+
+        <div class="mx-ch b">
+          <span class="ch-lab">CH B</span>
+          <div class="knobs">
+            <div class="knob-cell"><div class="knob" id="B-eq-high" data-deck="B" data-band="high"></div><button class="killbtn" id="B-kill-high" onclick="killEq('B','high')">HIGH</button></div>
+            <div class="knob-cell"><div class="knob" id="B-eq-mid" data-deck="B" data-band="mid"></div><button class="killbtn" id="B-kill-mid" onclick="killEq('B','mid')">MID</button></div>
+            <div class="knob-cell"><div class="knob" id="B-eq-low" data-deck="B" data-band="low"></div><button class="killbtn" id="B-kill-low" onclick="killEq('B','low')">LOW</button></div>
+          </div>
+          <div class="fader-cell">
+            <input class="vrange" id="B-vol" type="range" min="0" max="100" value="100"
+                   oninput="post({cmd:'trim',deck:'B',value:this.value/100})">
+            <div class="chmeter"><div class="chmeter-fill" id="B-chmeter"></div></div>
+          </div>
+          <span class="strip-lab">VOL B</span>
+        </div>
+      </div>
+
+      <div class="xfader-h" id="xfader">
         <span class="xf-end xf-a">A</span>
-        <div class="xf-rail"><div class="xf-knob" id="xf-knob"></div></div>
+        <div class="xf-rail-h" id="xf-rail"><div class="xf-knob-h" id="xf-knob"></div></div>
         <span class="xf-end xf-b">B</span>
       </div>
-      <div class="xf-info">
-        <div class="sync-pill" id="sync-pill">SYNC 0.0</div>
-        <div class="xf-next"><span class="xf-next-l" id="xf-next-l">NEXT MIX</span><span class="xf-next-v" id="xf-next">0:00</span></div>
-        <div class="xf-sub" id="xf-sub">BEAT SYNC</div>
+
+      <div class="mx-transport">
+        <button class="mx-btn cue" onclick="send('cue')">CUE NEXT</button>
+        <button class="mx-btn skip" onclick="send('skip')">SKIP</button>
+        <button class="mx-btn force" onclick="send('force')">FORCE MIX</button>
       </div>
     </div>
 
     <div class="deck b" id="deckB">
-      <div class="deck-head">
+      <div class="deck-top">
         <div class="chips"><span class="chip-deck">DECK B</span><span class="status" id="B-status">IDLE</span></div>
-        <span class="deck-ch">B</span>
+        <div class="deck-leds">
+          <span class="led sync" id="B-sync-led">SYNC</span>
+          <span class="led play" id="B-play-led">PLAY</span>
+        </div>
       </div>
       <div class="deck-title"><div class="t-name" id="B-title">&mdash;</div><div class="t-art" id="B-art"></div></div>
       <div class="bpm-row">
         <div class="bpm"><span class="bpm-v" id="B-bpm">0.0</span><span class="bpm-u">BPM</span></div>
         <div class="bm-side"><span class="bm-pill" id="B-bm">&bull; 0.0%</span><span class="bm-orig" id="B-orig"></span></div>
       </div>
-      <div class="wave" id="B-wave"></div>
+      <div class="beatline">
+        <div class="beats" id="B-beats"><span></span><span></span><span></span><span></span></div>
+        <span class="phrasetxt" id="B-phrase">&mdash;</span>
+      </div>
+      <div class="wavewrap">
+        <div class="wave" id="B-wave"></div>
+        <div class="cue cue-in" id="B-cue-in"></div>
+        <div class="cue cue-out" id="B-cue-out"></div>
+        <div class="playhead" id="B-head"></div>
+      </div>
       <div class="deck-foot"><span id="B-pos">0:00</span><span class="foot-mid" id="B-mid"></span><span id="B-dur">0:00</span></div>
+      <div class="jog-row">
+        <div class="pitch-col">
+          <input class="vrange pitch" id="B-pitch" type="range" min="-80" max="80" value="0"
+                 oninput="setPitch('B',this.value)">
+          <span class="pitch-v" id="B-pitch-v">+0.0%</span>
+          <span class="strip-lab">PITCH</span>
+        </div>
+        <div class="jog">
+          <svg class="jog-ring" viewBox="0 0 100 100">
+            <circle class="ring-bg" cx="50" cy="50" r="47"></circle>
+            <circle class="ring-fg" id="B-ring" cx="50" cy="50" r="47"></circle>
+          </svg>
+          <div class="jog-platter" id="B-platter"><div class="jog-mark"></div></div>
+          <div class="jog-center">
+            <span class="jog-pos" id="B-jog-pos">0:00</span>
+            <span class="jog-rem" id="B-jog-rem">-0:00</span>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -508,10 +874,7 @@ PAGE = r"""<!doctype html>
 
     <div class="controls">
       <div class="ctl-head"><span class="ctl-title">MANUAL OVERRIDE</span><span class="auto-pill"><span class="dot dot-ok"></span>AUTOPILOT</span></div>
-      <div class="ctl-actions">
-        <button class="big-btn" onclick="send('skip')"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 4 15 12 5 20 5 4"/><line x1="19" y1="5" x2="19" y2="19"/></svg><span>SKIP</span></button>
-        <button class="big-btn force" onclick="send('force')"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 9v3a9 9 0 0 0 9 9"/></svg><span>FORCE MIX</span></button>
-      </div>
+      <div class="ctl-hint">Jog-wheel transport &middot; CUE / SKIP / FORCE live on the mixer. Trim the room here.</div>
       <div class="nudge">
         <div class="nudge-lab">NUDGE ENERGY</div>
         <div class="nudge-row">
@@ -526,9 +889,20 @@ PAGE = r"""<!doctype html>
   <div class="upnext">
     <div class="up-head">
       <div class="up-head-l"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg><span>UP NEXT</span></div>
-      <span class="up-head-r" id="up-meta">MIX QUEUE</span>
+      <div class="up-add">
+        <input id="add-url" class="add-input" type="text" spellcheck="false"
+               placeholder="paste a YouTube link to queue it…"
+               onkeydown="if(event.key==='Enter')addUrl()">
+        <button class="add-btn" onclick="addUrl()">+ ADD</button>
+        <span class="up-head-r" id="up-meta">MIX QUEUE</span>
+      </div>
     </div>
     <div class="cards" id="cards"></div>
+  </div>
+
+  <div class="logpanel">
+    <div class="log-head"><span>AUTOPILOT DECISION LOG</span><span id="log-meta">LIVE FEED</span></div>
+    <div class="log-body" id="log-body"></div>
   </div>
 
 </div>
@@ -538,6 +912,61 @@ const $ = id => document.getElementById(id);
 function fmt(s){ if(s==null||isNaN(s)) return "0:00"; s=Math.max(0,s|0);
   return Math.floor(s/60)+":"+String(s%60).padStart(2,"0"); }
 function esc(x){ return String(x).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+// ---- control transport -------------------------------------------------
+function post(o){
+  fetch("/control",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(o)}).catch(()=>{});
+}
+// Legacy helper kept so the existing buttons (skip/force/cue/pause/nudge) work
+// unchanged: backend reads `value` then falls back to `delta`.
+function send(cmd, delta){ post({cmd, delta: delta||0}); }
+function setPitch(p, v){
+  $(p+"-pitch-v").textContent = (v>=0?"+":"")+(v/10).toFixed(1)+"%";
+  post({cmd:"bend", deck:p, value:v/1000});
+}
+function killEq(p, band){ post({cmd:"eq_kill", deck:p, band:band}); }
+// Don't clobber a control the DJ is actively touching with an SSE frame.
+function syncSlider(el, val){ if(el && document.activeElement!==el) el.value = val; }
+
+// ---- rotary EQ knobs ---------------------------------------------------
+// Each knob maps a gain of 0..1.5 onto a -135°..+135° dial sweep (unity = 12
+// o'clock). Vertical drag turns it; double-click snaps back to unity. The
+// engine's eq_manual is the source of truth — SSE frames repaint the dial
+// unless the DJ is mid-grab on that exact knob.
+const KNOB_MAX=1.5;
+function knobAngle(g){ return -135 + (Math.max(0,Math.min(KNOB_MAX,g))/KNOB_MAX)*270; }
+let draggingKnob=null;
+function paintKnob(id, gain){
+  const k=$(id); if(!k) return;
+  k.dataset.gain=gain;
+  const dial=k.querySelector(".knob-dial");
+  if(dial) dial.style.transform="rotate("+knobAngle(gain)+"deg)";
+  k.classList.toggle("killed", gain<=0.001);
+}
+function setKnob(id, gain){ if(draggingKnob!==id) paintKnob(id, gain); }   // from SSE
+function initKnob(id){
+  const k=$(id); if(!k) return;
+  k.innerHTML='<div class="knob-dial"><div class="knob-ind"></div></div>';
+  paintKnob(id, 1);
+  let startY=0, startG=1;
+  k.addEventListener("pointerdown", ev=>{
+    draggingKnob=id; k.setPointerCapture(ev.pointerId);
+    startY=ev.clientY; startG=parseFloat(k.dataset.gain||"1"); ev.preventDefault();
+  });
+  k.addEventListener("pointermove", ev=>{
+    if(draggingKnob!==id) return;
+    const g=Math.max(0,Math.min(KNOB_MAX, startG + (startY-ev.clientY)*0.01));
+    paintKnob(id, g);
+    post({cmd:"eq", deck:k.dataset.deck, band:k.dataset.band, value:g});
+  });
+  const end=ev=>{ if(draggingKnob===id){ draggingKnob=null;
+    try{ k.releasePointerCapture(ev.pointerId); }catch(_){} } };
+  k.addEventListener("pointerup", end);
+  k.addEventListener("pointercancel", end);
+  k.addEventListener("dblclick", ()=>{ paintKnob(id, 1);
+    post({cmd:"eq", deck:k.dataset.deck, band:k.dataset.band, value:1}); });
+}
 
 function energyColor(e){
   if(e<0.2)return"#1E3A8A"; if(e<0.4)return"#14B8A6"; if(e<0.6)return"#84CC16";
@@ -596,29 +1025,69 @@ function deck(p, d){
   $(p+"-dur").textContent = fmt(d.duration);
   $(p+"-mid").textContent = d.role==="live" ? "−"+fmt(d.remaining)+" TO MIX"
                           : (d.role==="cued" ? "CUE READY" : "");
-  updateWave(p+"-wave", d.duration>0 ? d.position/d.duration : 0);
+
+  // Phrase cue markers over the waveform (mix-in past the intro, mix-out at
+  // the outro). Hidden when there's no real structure (cue == 0 / == end).
+  const dur=d.duration||0;
+  const ci=$(p+"-cue-in"), co=$(p+"-cue-out");
+  if(dur>0 && d.mix_in>0.5){ ci.style.left=(100*d.mix_in/dur)+"%"; ci.style.display="block"; }
+  else ci.style.display="none";
+  if(dur>0 && d.mix_out>0 && d.mix_out<dur-0.5){ co.style.left=(100*d.mix_out/dur)+"%"; co.style.display="block"; }
+  else co.style.display="none";
+
+  // SYNC/PLAY LEDs: PLAY tracks the playhead, SYNC lights whenever a track is
+  // loaded (it's always beatmatched to the live deck on this engine).
+  $(p+"-play-led").classList.toggle("on", !!d.playing && !paused);
+  $(p+"-sync-led").classList.toggle("on", d.role!=="idle");
+
+  // Reflect the live engine state back into the channel controls (unless the
+  // DJ is mid-grab on that control). EQ is rotary; VOL is a fader.
+  const eq=d.eq||{low:1,mid:1,high:1};
+  setKnob(p+"-eq-high", eq.high);
+  setKnob(p+"-eq-mid",  eq.mid);
+  setKnob(p+"-eq-low",  eq.low);
+  $(p+"-kill-high").classList.toggle("killed", eq.high<=0.001);
+  $(p+"-kill-mid").classList.toggle("killed",  eq.mid<=0.001);
+  $(p+"-kill-low").classList.toggle("killed",  eq.low<=0.001);
+  syncSlider($(p+"-vol"), Math.round((d.trim==null?1:d.trim)*100));
+  const bend=d.bend||0;
+  syncSlider($(p+"-pitch"), Math.round(bend*1000));
+  if(document.activeElement!==$(p+"-pitch"))
+    $(p+"-pitch-v").textContent = (bend>=0?"+":"")+(bend*100).toFixed(1)+"%";
+
+  // Hand the beat grid to the rAF loop, which extrapolates between snapshots
+  // for a smooth playhead + beat pulse.
+  setAnim(p, d);
 }
 
 function render(s){
+  paused = !!s.paused;
+  const pp=$("playpause");
+  $("pp-ic").innerHTML = paused ? "&#9654;" : "&#9208;";   // ▶ resume / ⏸ pause
+  $("pp-txt").textContent = paused ? "RESUME" : "PAUSE";
+  pp.classList.toggle("paused", paused);
+
   deck("A", s.decks.A); deck("B", s.decks.B);
 
   const ga=s.decks.A.gain||0, gb=s.decks.B.gain||0, sum=ga+gb;
-  const pos = sum>0 ? gb/sum : (s.live==="B"?1:0);
-  $("xf-knob").style.top = (100*pos)+"%";
+  const xpos = sum>0 ? gb/sum : (s.live==="B"?1:0);
+  if(!draggingXf) $("xf-knob").style.left = (100*xpos)+"%";
   const lb = s.decks[s.live] ? s.decks[s.live].bpm : 0;
   $("sync-pill").textContent = "SYNC "+(lb||0).toFixed(1);
   const tr=s.transition, xf=$("xfader");
   if(tr && tr.active){
     xf.classList.add("mixing");
-    $("xf-next-l").textContent="MIXING";
-    $("xf-next").textContent=Math.round(tr.progress*100)+"%";
-    $("xf-sub").textContent=tr.from+" → "+tr.to;
+    $("xf-next-l").textContent = "MIXING " + tr.from + "→" + tr.to;
+    $("xf-next").textContent = Math.round(tr.progress*100)+"%";
   } else {
     xf.classList.remove("mixing");
-    $("xf-next-l").textContent="NEXT MIX";
-    $("xf-next").textContent=fmt(s.decks[s.live] ? s.decks[s.live].remaining : 0);
-    $("xf-sub").textContent="BEAT SYNC";
+    $("xf-next-l").textContent = "NEXT MIX";
+    $("xf-next").textContent = fmt(s.decks[s.live] ? s.decks[s.live].remaining : 0);
   }
+  // Bass-swap meter: the low-band energy each deck is actually putting out
+  // (DJ EQ × auto bass-swap). During a clean blend these cross over.
+  $("bs-A").style.width = (100*(s.decks.A.eq.low * s.decks.A.bass_auto))+"%";
+  $("bs-B").style.width = (100*(s.decks.B.eq.low * s.decks.B.bass_auto))+"%";
 
   const ce=s.crowd.energy, te=s.target_energy;
   crowdManual = !!s.crowd.manual;
@@ -679,14 +1148,135 @@ function render(s){
       +'<span style="color:'+ec+'">'+t.energy.toFixed(2)+'</span></div></div></div>';
   }).join("");
   $("cards").innerHTML = cards || '<div class="card-empty">buffering…</div>';
-}
 
-function send(cmd, delta){
-  fetch("/control",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({cmd, delta: delta||0})});
+  renderLog(s.log||[]);
 }
 
 function setCrowdMode(manual){ send("crowd_manual", manual?1:0); }
+
+// Paste a YouTube link → enqueue it. Download + analysis happen server-side on
+// a worker thread; the track shows up in UP NEXT and becomes a pick candidate
+// once it's ready (watch the decision log for "[add] ready …").
+function addUrl(){
+  const el=$("add-url"); const u=(el.value||"").trim();
+  if(!/^https?:\/\//i.test(u)){ el.placeholder="enter an http(s) link…"; el.value=""; return; }
+  post({cmd:"add_url", url:u});
+  el.value=""; el.blur(); el.placeholder="queued — fetching in the background…";
+  setTimeout(()=>{ el.placeholder="paste a YouTube link to queue it…"; }, 5000);
+}
+
+// ---- autopilot decision log -------------------------------------------
+function renderLog(items){
+  const body=$("log-body"); if(!body) return;
+  const rows = items.slice().reverse().map(it=>{
+    const m=it.m||"";
+    let cls="log-line";
+    if(m.indexOf("[mix]")>=0) cls+=" mix";
+    else if(m.indexOf("[cue]")>=0) cls+=" cue";
+    else if(m.indexOf("[start]")>=0 || m.indexOf("[live]")>=0) cls+=" live";
+    const d=new Date((it.t||0)*1000);
+    const ts=String(d.getHours()).padStart(2,"0")+":"
+            +String(d.getMinutes()).padStart(2,"0")+":"
+            +String(d.getSeconds()).padStart(2,"0");
+    return '<div class="'+cls+'"><span class="log-t">'+ts+'</span>'
+         + '<span class="log-m">'+esc(m)+'</span></div>';
+  }).join("");
+  body.innerHTML = rows || '<div class="log-line"><span class="log-m">waiting…</span></div>';
+}
+
+// ---- live beat pulse + playhead (client-side extrapolation) ------------
+// Each snapshot hands us a deck's playhead + beat grid; between snapshots we
+// advance the playhead in wall-clock time scaled by the deck's varispeed rate,
+// so the beat dots and playhead move at ~60fps instead of the 3Hz SSE rate.
+let anim={}, paused=false;
+function setAnim(p, d){
+  anim[p] = {
+    pos: d.position||0,
+    rate: (d.base_bpm>0 ? d.bpm/d.base_bpm : 1),  // source-sec advanced per wall-sec
+    off: d.beat_offset||0,
+    per: d.beat_period||0,
+    dur: d.duration||0,
+    playing: !!d.playing,
+    lvl: (d.gain||0)*(d.trim==null?1:d.trim),     // channel output level for the VU meter
+    tcap: performance.now(),
+  };
+}
+function pulse(){
+  const now=performance.now();
+  for(const p of ["A","B"]){
+    const a=anim[p];
+    const dots=$(p+"-beats").children;
+    if(!a){ requestAnimationFrame(pulse); return; }
+    let local=a.pos;
+    if(a.playing && !paused) local += (now - a.tcap)/1000 * a.rate;
+    const frac = a.dur>0 ? Math.max(0,Math.min(1, local/a.dur)) : 0;
+    $(p+"-head").style.left = (100*frac)+"%";
+    updateWave(p+"-wave", frac);
+
+    // Jog wheel: ring fills with track progress, platter spins one turn per bar
+    // (slowing to a stop when paused/stopped), center shows elapsed / -remaining.
+    const ring=$(p+"-ring");
+    if(ring){ const C=2*Math.PI*47;
+      ring.style.strokeDasharray=C; ring.style.strokeDashoffset=C*(1-frac); }
+    const plat=$(p+"-platter");
+    if(plat){
+      const ang = a.per>0 ? ((local-a.off)/(4*a.per))*360 : local*90;
+      plat.style.transform="rotate("+(((ang%360)+360)%360)+"deg)";
+    }
+    if(a.dur>0){
+      $(p+"-jog-pos").textContent = fmt(local);
+      $(p+"-jog-rem").textContent = "-"+fmt(Math.max(0, a.dur-local));
+    } else { $(p+"-jog-pos").textContent="0:00"; $(p+"-jog-rem").textContent="-0:00"; }
+
+    // Channel VU: output level (gain×trim) pumped on the beat for a live feel.
+    const mtr=$(p+"-chmeter");
+    if(mtr){
+      let h=0;
+      if(a.playing && !paused){
+        const ph = a.per>0 ? ((((local-a.off)%a.per)+a.per)%a.per)/a.per : 0.5;
+        h=(a.lvl||0)*(0.45+0.55*(1-ph));
+      }
+      mtr.style.height=(100*Math.max(0,Math.min(1,h)))+"%";
+    }
+
+    if(a.per>0 && a.playing){
+      const tb=local - a.off;
+      const beatIx=Math.floor(tb/a.per);
+      const phase=(((tb % a.per)+a.per)%a.per)/a.per;
+      const beatInBar=((beatIx%4)+4)%4;
+      const barInPhrase=((Math.floor(beatIx/4)%8)+8)%8;
+      for(let i=0;i<4;i++){
+        const on=(i===beatInBar);
+        dots[i].style.opacity = on ? (0.30+0.70*(1-phase)) : 0.12;
+        dots[i].classList.toggle("hit", on && phase<0.20);
+      }
+      $(p+"-phrase").textContent = "BAR "+(barInPhrase+1)+"/8 · BEAT "+(beatInBar+1)+"/4";
+    } else {
+      for(let i=0;i<4;i++){ dots[i].style.opacity=0.12; dots[i].classList.remove("hit"); }
+      $(p+"-phrase").textContent = "—";
+    }
+  }
+  requestAnimationFrame(pulse);
+}
+requestAnimationFrame(pulse);
+
+// ---- crossfader scrub (drag the rail to push/pull a live transition) --
+let draggingXf=false;
+(function(){
+  const rail=$("xf-rail");
+  const frac=ev=>{ const r=rail.getBoundingClientRect();
+    return Math.max(0,Math.min(1,(ev.clientX-r.left)/r.width)); };
+  rail.addEventListener("pointerdown", ev=>{
+    draggingXf=true; rail.setPointerCapture(ev.pointerId);
+    const f=frac(ev); $("xf-knob").style.left=(100*f)+"%"; post({cmd:"xfade", value:f});
+  });
+  rail.addEventListener("pointermove", ev=>{ if(draggingXf){
+    const f=frac(ev); $("xf-knob").style.left=(100*f)+"%"; post({cmd:"xfade", value:f}); } });
+  const end=ev=>{ if(draggingXf){ draggingXf=false;
+    try{ rail.releasePointerCapture(ev.pointerId); }catch(_){} } };
+  rail.addEventListener("pointerup", end);
+  rail.addEventListener("pointercancel", end);
+})();
 
 // Vibe fader: when manual is engaged, drag the CROWD meter to dictate the room.
 let crowdManual=false, draggingVibe=false;
@@ -720,6 +1310,7 @@ function vibeSet(ev){
 
 buildWave("A-wave", 0x51ED); buildWave("B-wave", 0xB0A7);
 buildMeter("crowd-segs"); buildMeter("target-segs");
+["A","B"].forEach(p=>["high","mid","low"].forEach(b=>initKnob(p+"-eq-"+b)));
 
 const t0=Date.now();
 setInterval(()=>{

@@ -107,8 +107,11 @@ mutate engine state, transition/beatmatch/buffer all render); **live audio outpu
 real Lane 8/Elderbrook YouTube set through speakers); **bass-swap EQ** (headless: lows trade,
 unity transparent, no clipping); **section-aware mixing** (headless: intro/outro detected,
 phrase-snapped cues, controller fires at outro & brings incoming in past its intro).
-NOT tested: real webcam; EQ bass-swap + section cues *by ear* on a real set (logic verified, not
-yet auditioned through speakers).
+Deployed: the live YouTube set on `--dashboard --port 8765` now runs the new bass-swap EQ +
+section-aware mixing code through real speakers (crowd simulated). It comes up clean — buffers
+the playlist, starts on track 1, dashboard serves the new manual-crowd UI, no tracebacks.
+NOT tested: real webcam; EQ bass-swap + section cues *by ear* on a real set (logic verified and
+now running live, but not yet critically auditioned through speakers).
 
 ## Constraints / preferences
 - **Disk is tight on this machine.** Delete reproducible artifacts (yt-dlp caches, demo tracks,

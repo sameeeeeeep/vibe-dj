@@ -64,6 +64,22 @@ class TrackPool:
                 pass
         self.log(f"[drop]  {track.name[:38]}  deleted  (pool {len(self._tracks)})")
 
+    def add_url(self, url: str, log: Optional[Callable[[str], None]] = None) -> list[Track]:
+        """Splice a YouTube URL into the streaming queue. The entry jumps to the
+        front so the filler downloads + analyses it next, and joins the loop
+        candidates so it recurs. Returns [] — the track is added asynchronously
+        by the filler thread (mirrors Library.add_url's interface)."""
+        log = log or self.log
+        entries = yt.list_entries([url], log=log)
+        if not entries:
+            log(f"[add]   no playable entries for {url}")
+            return []
+        for e in reversed(entries):
+            self._queue.appendleft(e)     # deque ops are atomic — fetched next
+        self._candidates.extend(entries)  # keep it in the looped playlist
+        log(f"[add]   queued {len(entries)} from URL (downloading next)")
+        return []
+
     # ---- lifecycle -------------------------------------------------------
     def prime(self) -> int:
         """List the playlist and download the first track synchronously."""

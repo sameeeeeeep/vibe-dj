@@ -28,10 +28,19 @@ class Mixer:
         self.current = "A"
         self.dry_run = dry_run
 
-        # Per-deck 3-band EQ and its (low, mid, high) gains. Unity is transparent;
-        # the bass-swap automation drives these during a crossfade.
+        # Per-deck 3-band EQ. Two sources drive the band gains and compose by
+        # multiplication so they never fight each other:
+        #   eq_manual — the DJ's EQ (low/mid/high, 1.0 = unity, 0.0 = killed)
+        #   bass_auto — the bass-swap automation's low-band factor during a fade
+        # Effective low gain = eq_manual.low * bass_auto; mid/high = eq_manual.
         self.eqs = {"A": ThreeBandEQ(), "B": ThreeBandEQ()}
-        self.bands = {"A": [1.0, 1.0, 1.0], "B": [1.0, 1.0, 1.0]}
+        self.eq_manual = {"A": [1.0, 1.0, 1.0], "B": [1.0, 1.0, 1.0]}
+        self.bass_auto = {"A": 1.0, "B": 1.0}
+
+        # Per-channel volume trim (the DJ's line faders) and a master pause that
+        # freezes both decks and mutes the output, resuming exactly in place.
+        self.trim = {"A": 1.0, "B": 1.0}
+        self.paused = False
 
         self._xf_lock = threading.Lock()
         self._xf_active = False
@@ -59,7 +68,9 @@ class Mixer:
 
     def _reset_eq(self, name: str) -> None:
         self.eqs[name].reset()
-        self.bands[name] = [1.0, 1.0, 1.0]
+        self.eq_manual[name] = [1.0, 1.0, 1.0]
+        self.bass_auto[name] = 1.0
+        # Trim is a physical line fader: it persists across track loads.
 
     def load_idle(self, samples: np.ndarray, analysis: Analysis, title: str) -> None:
         self.idle_deck.load(samples, analysis, title)
@@ -130,30 +141,78 @@ class Mixer:
 
             # Bass swap: trade the lows over the swap window so only one bassline
             # plays at a time. Mids/highs ride the equal-power volume fade above.
+            # This drives only the auto factor; the DJ's manual EQ multiplies on
+            # top in mix(), so a manual kill and the swap coexist.
             swap = (p - BASS_SWAP_START) / (BASS_SWAP_END - BASS_SWAP_START)
             swap = min(1.0, max(0.0, swap))
-            self.bands[self._xf_from] = [1.0 - swap, 1.0, 1.0]
-            self.bands[self._xf_to] = [swap, 1.0, 1.0]
+            self.bass_auto[self._xf_from] = 1.0 - swap
+            self.bass_auto[self._xf_to] = swap
 
             if p >= 1.0:
                 frm.gain = 0.0
                 frm.playing = False
                 to.gain = 1.0
-                self.bands[self._xf_from] = [1.0, 1.0, 1.0]
-                self.bands[self._xf_to] = [1.0, 1.0, 1.0]
+                self.bass_auto[self._xf_from] = 1.0
+                self.bass_auto[self._xf_to] = 1.0
                 self.current = self._xf_to
                 self._xf_active = False
 
+    def effective_bands(self, name: str) -> list[float]:
+        """The (low, mid, high) gains actually applied to a deck right now:
+        the DJ's EQ with the bass-swap automation folded into the low band."""
+        lo, mid, hi = self.eq_manual[name]
+        return [lo * self.bass_auto[name], mid, hi]
+
+    # ---- manual controls (dashboard) ------------------------------------
+    _BAND_IX = {"low": 0, "mid": 1, "high": 2}
+
+    def set_paused(self, on: bool) -> None:
+        self.paused = bool(on)
+
+    def toggle_pause(self) -> bool:
+        self.paused = not self.paused
+        return self.paused
+
+    def set_eq(self, deck: str, band: str, gain: float) -> None:
+        i = self._BAND_IX.get(band)
+        if i is None or deck not in self.eq_manual:
+            return
+        self.eq_manual[deck][i] = float(min(1.5, max(0.0, gain)))
+
+    def toggle_kill(self, deck: str, band: str) -> None:
+        i = self._BAND_IX.get(band)
+        if i is None or deck not in self.eq_manual:
+            return
+        self.eq_manual[deck][i] = 0.0 if self.eq_manual[deck][i] > 0.0 else 1.0
+
+    def set_trim(self, deck: str, value: float) -> None:
+        if deck in self.trim:
+            self.trim[deck] = float(min(1.0, max(0.0, value)))
+
+    def set_bend(self, deck: str, frac: float) -> None:
+        d = self.decks.get(deck)
+        if d is not None:
+            d.bend = float(min(RATE_LIMIT, max(-RATE_LIMIT, frac)))
+
+    def scrub_crossfade(self, frac: float) -> None:
+        """Push/pull a live transition by hand (no-op when not transitioning)."""
+        with self._xf_lock:
+            if self._xf_active:
+                self._xf_done = int(min(1.0, max(0.0, frac)) * self._xf_total)
+
     # ---- audio generation ------------------------------------------------
     def mix(self, n: int) -> np.ndarray:
+        if self.paused:
+            # Frozen: no deck advance, silent output. Resumes exactly in place.
+            return np.zeros((n, CHANNELS), dtype=np.float32)
         self._advance_crossfade(n)
         out = np.zeros((n, CHANNELS), dtype=np.float32)
         for name, d in self.decks.items():
             g = d.gain
             if g <= 0.0 and not d.playing:
                 continue
-            lg, mg, hg = self.bands[name]
-            out += self.eqs[name].process(d.read(n), lg, mg, hg) * g
+            lg, mg, hg = self.effective_bands(name)
+            out += self.eqs[name].process(d.read(n), lg, mg, hg) * (g * self.trim[name])
         np.clip(out, -1.0, 1.0, out=out)
         return out
 

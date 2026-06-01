@@ -42,6 +42,10 @@ def main() -> int:
     ap.add_argument("--crossfade", type=float, default=12.0, help="crossfade length, seconds")
     ap.add_argument("--cue-lead", type=float, default=25.0, help="cue the next track this long before the end")
     ap.add_argument("--duration", type=float, default=0.0, help="auto-stop after N seconds (0 = run forever)")
+    ap.add_argument("--auto-dig", action="store_true",
+                    help="auto crate-digger: top up the queue with vibe-matched YouTube tracks (folder mode)")
+    ap.add_argument("--dig-interval", type=float, default=20.0, help="seconds between crate-dig passes")
+    ap.add_argument("--dig-min", type=int, default=4, help="dig more when fresh unplayed tracks dip below this")
     args = ap.parse_args()
 
     if not have_ffmpeg():
@@ -89,6 +93,20 @@ def main() -> int:
         dashboard = Dashboard(controller, mixer, crowd, library, port=args.port).start()
         print(f"Dashboard: http://127.0.0.1:{args.port}")
 
+    scout = None
+    if args.auto_dig:
+        if hasattr(library, "add_analyzed"):
+            from dj.scout import Scout
+            scout = Scout(
+                library, controller,
+                cache_dir=getattr(library, "folder", args.cache_dir),
+                min_fresh=args.dig_min, interval=args.dig_interval,
+                log=print,
+            ).start()
+            print(f"Auto-dig: ON  (top up below {args.dig_min} fresh, every {args.dig_interval:.0f}s)")
+        else:
+            print("Auto-dig: skipped (the streaming pool already fills itself)")
+
     start = time.monotonic()
     try:
         while True:
@@ -104,6 +122,8 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nstopping...")
     finally:
+        if scout is not None:
+            scout.stop()
         if dashboard is not None:
             dashboard.stop()
         controller.stop()
