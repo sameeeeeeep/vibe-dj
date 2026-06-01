@@ -308,7 +308,9 @@ class BeatMachine:
         self.enabled = not self.enabled
 
     def set_level(self, v: float) -> None:
-        self.level = float(min(1.0, max(0.0, v)))
+        # Ceiling > 1.0 so the layer can be pushed *louder* than unity (up to
+        # +6 dB) when it needs to cut through a hot track.
+        self.level = float(min(2.0, max(0.0, v)))
 
     def set_mode(self, m: str) -> None:
         if m in ("auto", "manual"):

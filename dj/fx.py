@@ -87,7 +87,8 @@ class FXRack:
 
     # ---- controls --------------------------------------------------------
     def set_level(self, v: float) -> None:
-        self.level = float(min(1.0, max(0.0, v)))
+        # Ceiling > 1.0 so pads can be pushed *louder* than unity (up to +6 dB).
+        self.level = float(min(2.0, max(0.0, v)))
 
     def trigger(self, idx: int) -> None:
         """(Re)start a pad from its head — retriggering chokes the prior hit."""

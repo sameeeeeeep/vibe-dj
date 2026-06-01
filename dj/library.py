@@ -111,7 +111,11 @@ class Library:
             key = path
             cached = cache.get(key)
             sig = {"mtime": st.st_mtime, "size": st.st_size}
-            if cached and cached.get("mtime") == sig["mtime"] and cached.get("size") == sig["size"]:
+            if (cached and cached.get("mtime") == sig["mtime"]
+                    and cached.get("size") == sig["size"]
+                    and "key_root" in (cached.get("analysis") or {})):
+                # "key_root" gate forces re-analysis of entries cached before key
+                # detection existed, so autotune has a key to snap to.
                 an = Analysis(**cached["analysis"])
             else:
                 try:

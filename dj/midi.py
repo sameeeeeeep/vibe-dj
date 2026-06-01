@@ -153,6 +153,22 @@ def parse_midi(path: str) -> dict:
             "name": os.path.basename(path)}
 
 
+# ---- autotune: snap a note into the track's key --------------------------
+def _snap_to_scale(pitch: int, scale: frozenset) -> int:
+    """Snap a MIDI pitch to the nearest pitch whose pitch-class is in `scale`
+    (a set of allowed pitch classes 0..11). In a diatonic scale every off-key
+    note is at most one semitone from a scale tone, so this nudges gently. Ties
+    snap downward. An empty scale leaves the pitch untouched (autotune off)."""
+    if not scale or (pitch % 12) in scale:
+        return pitch
+    for d in range(1, 7):                       # search outward, nearest first
+        if (pitch - d) % 12 in scale:
+            return pitch - d
+        if (pitch + d) % 12 in scale:
+            return pitch + d
+    return pitch
+
+
 # ---- the synth melody layer ----------------------------------------------
 class MelodyLayer:
     """A loaded MIDI melody, synthesised and looped beat-locked to the live deck.
@@ -164,6 +180,7 @@ class MelodyLayer:
         self.enabled = False
         self.level = 0.6
         self.transpose = 0          # semitones, clamped +/- 24
+        self.autotune = False       # snap notes into the live track's key
         # Published atomically by load(): (notes, length_beats, name, rev) or None
         self._song: tuple | None = None
         self._rev = 0
@@ -173,6 +190,7 @@ class MelodyLayer:
         self._loop_frames = 0
         self._loop_transpose = 0
         self._loop_rev = -1
+        self._loop_scale: frozenset = frozenset()   # key the cached loop snapped to
 
     # ---- controls --------------------------------------------------------
     def set_enabled(self, on: bool) -> None:
@@ -182,10 +200,17 @@ class MelodyLayer:
         self.enabled = not self.enabled
 
     def set_level(self, v: float) -> None:
-        self.level = float(min(1.0, max(0.0, v)))
+        # Ceiling > 1.0 so the melody can be pushed *louder* than unity (+6 dB).
+        self.level = float(min(2.0, max(0.0, v)))
 
     def set_transpose(self, semitones: float) -> None:
         self.transpose = int(max(-24, min(24, round(semitones))))
+
+    def set_autotune(self, on: bool) -> None:
+        self.autotune = bool(on)
+
+    def toggle_autotune(self) -> None:
+        self.autotune = not self.autotune
 
     def clear(self) -> None:
         with self._lock:
@@ -214,6 +239,7 @@ class MelodyLayer:
             "enabled": self.enabled,
             "level": round(self.level, 3),
             "transpose": self.transpose,
+            "autotune": self.autotune,
             "loaded": song is not None,
             "name": song[2] if song else "",
             "notes": len(song[0]) if song else 0,
@@ -221,8 +247,8 @@ class MelodyLayer:
         }
 
     # ---- audio -----------------------------------------------------------
-    def _synth_loop(self, loop_frames: int, length_beats: int,
-                    notes: tuple, transpose: int) -> np.ndarray:
+    def _synth_loop(self, loop_frames: int, length_beats: int, notes: tuple,
+                    transpose: int, scale: frozenset) -> np.ndarray:
         buf = np.zeros(loop_frames, dtype=np.float32)
         fpb = loop_frames / length_beats          # frames per beat
         atk = max(1, int(0.008 * SAMPLE_RATE))
@@ -230,7 +256,11 @@ class MelodyLayer:
         for pitch, sb, db, vel in notes:
             start = int(sb * fpb) % loop_frames
             ln = max(1, int(db * fpb))
-            f = 440.0 * 2.0 ** ((pitch - 69 + transpose) / 12.0)
+            # Manual transpose first, then autotune-snap the result into key.
+            p = int(pitch) + transpose
+            if scale:
+                p = _snap_to_scale(p, scale)
+            f = 440.0 * 2.0 ** ((p - 69) / 12.0)
             t = np.arange(ln, dtype=np.float32) / SAMPLE_RATE
             ph = 2 * np.pi * f * t
             wave = np.sin(ph) + 0.25 * np.sin(2 * ph) + 0.12 * np.sin(3 * ph)
@@ -267,14 +297,25 @@ class MelodyLayer:
             if loop_frames < 2048:
                 return np.zeros((n, CHANNELS), dtype=np.float32)
             tr = self.transpose
+            # Autotune: snap notes into the live track's detected key. The scale
+            # comes from the deck's analysis, so it changes when the track does —
+            # keying the cache on it rebuilds the loop on a key change.
+            scale: frozenset = frozenset()
+            if self.autotune:
+                sp = getattr(an, "scale_pcs", None)
+                if callable(sp):
+                    scale = frozenset(sp())
             if (self._loop is None or self._loop_rev != rev
                     or self._loop_transpose != tr
+                    or self._loop_scale != scale
                     or abs(loop_frames - self._loop_frames)
                     > max(64, 0.006 * max(1, self._loop_frames))):
-                self._loop = self._synth_loop(loop_frames, length_beats, notes, tr)
+                self._loop = self._synth_loop(loop_frames, length_beats, notes,
+                                              tr, scale)
                 self._loop_frames = loop_frames
                 self._loop_transpose = tr
                 self._loop_rev = rev
+                self._loop_scale = scale
             loop = self._loop
             L = self._loop_frames
             t = deck.position_sec - an.beat_offset

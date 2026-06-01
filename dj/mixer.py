@@ -422,7 +422,12 @@ class Mixer:
 
     # ---- MIDI melody layer ----------------------------------------------
     def melody_state(self) -> dict:
-        return self.melody.state()
+        st = self.melody.state()
+        # Attach the live track's detected key so the dashboard can show what
+        # autotune is snapping the melody into.
+        an = getattr(self.live_deck, "analysis", None)
+        st["track_key"] = an.key_name() if an is not None else ""
+        return st
 
     # ---- headphone cue (second output) ----------------------------------
     @staticmethod

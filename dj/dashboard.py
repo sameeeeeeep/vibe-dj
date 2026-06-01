@@ -22,7 +22,7 @@ Endpoints:
                             beats_style | fx_add_url | fx_trigger | fx_level |
                             fx_clear | melody_load | melody_toggle |
                             melody_enable | melody_level | melody_transpose |
-                            melody_clear
+                            melody_autotune | melody_clear
 """
 
 from __future__ import annotations
@@ -345,6 +345,8 @@ class Dashboard:
             self.mixer.melody.set_level(value)
         elif cmd == "melody_transpose":
             self.mixer.melody.set_transpose(value)
+        elif cmd == "melody_autotune":
+            self.mixer.melody.set_autotune(value >= 0.5)
         elif cmd == "melody_clear":
             self.mixer.melody.clear()
 
@@ -899,6 +901,13 @@ PAGE = r"""<!doctype html>
   .mel-tb:hover{border-color:var(--accent);color:var(--tp);}
   .mel-tr{font-family:var(--f-mono);font-size:12px;color:var(--tp);width:30px;text-align:center;}
   .mel-row2 input{flex:1;min-width:60px;}
+  .mel-row3{display:flex;align-items:center;gap:9px;}
+  .mel-at{background:var(--bg-raised);color:var(--td);border:1px solid var(--border);border-radius:7px;
+    padding:6px 12px;font-family:var(--f-disp);font-weight:700;font-size:10px;letter-spacing:.13em;
+    cursor:pointer;transition:background .12s,color .12s,box-shadow .12s;}
+  .mel-at.on{background:var(--accent);color:#fff;border-color:var(--accent);box-shadow:0 0 13px var(--accent);}
+  .mel-key{font-family:var(--f-mono);font-size:10px;letter-spacing:.05em;color:var(--tf);}
+  .mel-key.live{color:var(--accent);}
   .cue::before{content:"";position:absolute;top:-4px;left:-2px;width:6px;height:6px;border-radius:1px;background:inherit;}
   .playhead{position:absolute;top:-5px;bottom:-5px;left:0;width:2px;background:var(--tp);z-index:3;
     pointer-events:none;box-shadow:0 0 7px #fff9;}
@@ -1249,7 +1258,7 @@ PAGE = r"""<!doctype html>
         </div>
         <div class="beats-row3">
           <span class="beats-lab">MIX</span>
-          <input id="beats-lvl" type="range" min="0" max="100" value="55"
+          <input id="beats-lvl" type="range" min="0" max="200" value="55"
                  oninput="post({cmd:'beats_level', value:this.value/100})">
           <span class="beats-val" id="beats-lvl-v">.55</span>
         </div>
@@ -1278,7 +1287,7 @@ PAGE = r"""<!doctype html>
         <div class="fx-pads" id="fx-pads"></div>
         <div class="fx-rowlvl">
           <span class="beats-lab">FX</span>
-          <input id="fx-lvl" type="range" min="0" max="100" value="80"
+          <input id="fx-lvl" type="range" min="0" max="200" value="80"
                  oninput="post({cmd:'fx_level', value:this.value/100})">
           <span class="beats-val" id="fx-lvl-v">.80</span>
         </div>
@@ -1305,9 +1314,13 @@ PAGE = r"""<!doctype html>
           <span class="mel-tr" id="mel-tr">0</span>
           <button class="mel-tb" onclick="melTrans(1)">+</button>
           <span class="beats-lab" style="margin-left:8px;">MIX</span>
-          <input id="mel-lvl" type="range" min="0" max="100" value="60"
+          <input id="mel-lvl" type="range" min="0" max="200" value="60"
                  oninput="post({cmd:'melody_level', value:this.value/100})">
           <span class="beats-val" id="mel-lvl-v">.60</span>
+        </div>
+        <div class="mel-row3">
+          <button class="mel-at" id="mel-at" onclick="melAuto()">AUTOTUNE</button>
+          <span class="mel-key" id="mel-key">key —</span>
         </div>
       </div>
     </div>
@@ -1834,6 +1847,14 @@ function renderMelody(m, files){
   const sl = $("mel-lvl"), lvl = (m.level==null?0.6:m.level);
   if(document.activeElement!==sl) syncSlider(sl, Math.round(lvl*100));
   $("mel-lvl-v").textContent = fmtv(lvl);
+  // Autotune: toggle + live-key readout. When on, the synth notes snap into the
+  // live track's detected key (shown here); when the key is unknown it's a no-op.
+  const on = !!m.autotune;
+  $("mel-at").classList.toggle("on", on);
+  const k = m.track_key || "";
+  const kEl = $("mel-key");
+  kEl.textContent = on ? ("→ "+(k||"key ?")) : ("key "+(k||"—"));
+  kEl.classList.toggle("live", on && !!k);
 }
 function melLoad(){
   const p = $("mel-file").value;
@@ -1844,6 +1865,7 @@ function melLoadPath(){
   if(p){ post({cmd:"melody_load", path:p}); el.value=""; }
 }
 function melTrans(d){ post({cmd:"melody_transpose", value:(_mel.transpose||0)+d}); }
+function melAuto(){ post({cmd:"melody_autotune", value:(_mel.autotune?0:1)}); }
 
 // ---- monitor / headphone-cue (second audio output) --------------------
 // Mirror the engine's cue state into the panel: device dropdown (rebuilt only
