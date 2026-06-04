@@ -45,6 +45,10 @@ def main() -> int:
                          "e.g. 'Speakers') so it won't follow the system default onto AirPods")
     ap.add_argument("--dashboard", action="store_true", help="serve the live web dashboard")
     ap.add_argument("--port", type=int, default=8765, help="dashboard port (default 8765)")
+    ap.add_argument("--lan", action="store_true",
+                    help="bind the dashboard to all interfaces (0.0.0.0) so other Macs/phones on "
+                         "the same Wi-Fi can open /listen and hear the set. Also exposes the "
+                         "control UI to the LAN — only use on a network you trust.")
     ap.add_argument("--crossfade", type=float, default=12.0, help="crossfade length, seconds")
     ap.add_argument("--cue-lead", type=float, default=25.0, help="cue the next track this long before the end")
     ap.add_argument("--duration", type=float, default=0.0, help="auto-stop after N seconds (0 = run forever)")
@@ -94,25 +98,36 @@ def main() -> int:
     mixer.start()
     controller.start_set()
 
+    # Build the crate-digger up front (when the source can splice in new tracks)
+    # so the dashboard's "fetch similar" button works even without the background
+    # auto-dig loop; only --auto-dig starts the periodic top-up loop.
+    scout = None
+    if hasattr(library, "add_analyzed"):
+        from dj.scout import Scout
+        scout = Scout(
+            library, controller,
+            cache_dir=getattr(library, "folder", args.cache_dir),
+            min_fresh=args.dig_min, interval=args.dig_interval,
+            log=print,
+        )
+        if args.auto_dig:
+            scout.start()
+            print(f"Auto-dig: ON  (top up below {args.dig_min} fresh, every {args.dig_interval:.0f}s)")
+    elif args.auto_dig:
+        print("Auto-dig: skipped (the streaming pool already fills itself)")
+
     dashboard = None
     if args.dashboard:
         from dj.dashboard import Dashboard
-        dashboard = Dashboard(controller, mixer, crowd, library, port=args.port).start()
+        host = "0.0.0.0" if args.lan else "127.0.0.1"
+        dashboard = Dashboard(controller, mixer, crowd, library,
+                              scout=scout, host=host, port=args.port).start()
         print(f"Dashboard: http://127.0.0.1:{args.port}")
-
-    scout = None
-    if args.auto_dig:
-        if hasattr(library, "add_analyzed"):
-            from dj.scout import Scout
-            scout = Scout(
-                library, controller,
-                cache_dir=getattr(library, "folder", args.cache_dir),
-                min_fresh=args.dig_min, interval=args.dig_interval,
-                log=print,
-            ).start()
-            print(f"Auto-dig: ON  (top up below {args.dig_min} fresh, every {args.dig_interval:.0f}s)")
-        else:
-            print("Auto-dig: skipped (the streaming pool already fills itself)")
+        if args.lan:
+            print(f"LAN listen: http://{dashboard._lan_ip}:{args.port}/listen  "
+                  f"(open on any Mac/phone on this Wi-Fi)")
+            print("  note: --lan also exposes the control UI to the network; "
+                  "only use on a trusted Wi-Fi.")
 
     start = time.monotonic()
     try:

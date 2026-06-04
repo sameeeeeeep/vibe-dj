@@ -6,9 +6,15 @@ controller/mixer/crowd/library each tick and streams JSON to the browser, while
 POSTs from the browser inject control commands (skip, force-transition, nudge).
 
 Endpoints:
-    GET  /            the single-page dashboard
+    GET  /            the single-page dashboard (DJ control UI)
     GET  /events      SSE stream of engine snapshots (~3 Hz)
     GET  /frame.jpg   latest crowd-cam frame (204 when simulated / no camera)
+    GET  /listen      guest listen page (low-latency Web Audio player + jukebox)
+    GET  /ws-audio    low-latency raw-PCM stream over a WebSocket (preferred)
+    GET  /stream.mp3  MP3 stream of the master mix (compatibility fallback)
+    GET  /jukebox            guest view: now playing + up-next + loaded crate
+    GET  /jukebox/search?q=  YouTube text search (metadata only, no download)
+    POST /jukebox/request    {"tid"|"vid", "title"} guest request → auto-queue
     POST /control     {"cmd": ..., "deck": "A"|"B", "band": "low"|"mid"|"high",
                        "value": <float>, "url": <str>}
                       cmds: skip | force | cue | pause | nudge | crowd_manual |
@@ -19,20 +25,64 @@ Endpoints:
                             cue_source | cue_level | cue_audition |
                             cue_audition_stop | beats_toggle | beats_enable |
                             beats_level | beats_mode | beats_intensity |
-                            beats_style | fx_add_url | fx_trigger | fx_level |
-                            fx_clear | melody_load | melody_toggle |
+                            beats_style | fx_add_url | fx_trigger | fx_loop |
+                            fx_level | fx_clear | melody_load | melody_toggle |
                             melody_enable | melody_level | melody_transpose |
                             melody_autotune | melody_clear
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
+import queue
+import socket
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
+
+from .netcast import NetCast
+
+# Most jukebox (LAN-guest) YouTube downloads allowed in flight at once. Crate
+# requests are free (no download); this only throttles fetch-from-YouTube so a
+# guest tapping a dozen results can't pile up downloads on a tight disk.
+_JUKEBOX_MAX_INFLIGHT = 4
+_JUKEBOX_SEARCH_RESULTS = 6
+
+# WebSocket low-latency audio: RFC6455 magic GUID for the accept-key handshake.
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def _ws_frame(payload: bytes) -> bytes:
+    """Wrap bytes in a single unmasked binary WebSocket frame (server→client).
+    FIN=1, opcode=0x2 (binary); server frames are never masked."""
+    n = len(payload)
+    if n < 126:
+        header = bytes([0x82, n])
+    elif n < 65536:
+        header = bytes([0x82, 126]) + n.to_bytes(2, "big")
+    else:
+        header = bytes([0x82, 127]) + n.to_bytes(8, "big")
+    return header + payload
+
+
+def _lan_ip() -> str:
+    """Best-effort LAN address of this machine, for the 'listen on another Mac'
+    URL. Opens a UDP socket toward a public IP (no packets are actually sent) and
+    reads back the local address the OS would route from. Falls back to the
+    loopback if there's no network."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
 
 
 class _QuietHTTPServer(ThreadingHTTPServer):
@@ -48,14 +98,21 @@ class _QuietHTTPServer(ThreadingHTTPServer):
 
 
 class Dashboard:
-    def __init__(self, controller, mixer, crowd, library,
+    def __init__(self, controller, mixer, crowd, library, scout=None,
                  host: str = "127.0.0.1", port: int = 8765):
         self.controller = controller
         self.mixer = mixer
         self.crowd = crowd
         self.library = library
+        self.scout = scout
         self.host = host
         self.port = port
+        # LAN audio broadcast: encode the master mix to MP3 and fan it out to
+        # listeners on the same Wi-Fi (GET /stream.mp3, played by GET /listen).
+        # Hung off the mixer so its audio callback can feed each mixed block.
+        self.netcast = NetCast()
+        self.mixer.netcast = self.netcast
+        self._lan_ip = _lan_ip()
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -69,6 +126,12 @@ class Dashboard:
         # every SSE frame would be wasteful) — refreshed on a slow cadence.
         self._midi_files: list[dict] = []
         self._midi_files_ts = 0.0
+        # Jukebox: LAN guests (on /listen) can request tracks straight into the
+        # up-next queue. A YouTube request kicks off a download+analyse on a
+        # worker thread; cap how many can be in flight at once so a guest can't
+        # spam the network/disk, and dedupe by video id.
+        self._jukebox_lock = threading.Lock()
+        self._jukebox_inflight: set[str] = set()
 
     # ---- state -----------------------------------------------------------
     def _deck_info(self, name: str) -> dict:
@@ -93,6 +156,9 @@ class Dashboard:
             "energy": round(track.energy, 3) if track else None,
             "gain": round(d.gain, 3),
             "playing": d.playing,
+            # Real peak envelope of the loaded track (0..1 per bin) for the
+            # waveform display; empty on an idle deck so it reads clean.
+            "wave": d.wave if loaded else [],
             "position": round(d.position_sec, 2),
             "duration": round(an.duration, 1) if an else 0.0,
             "remaining": round(d.remaining_sec, 1),
@@ -228,6 +294,10 @@ class Dashboard:
             "crate_rev": self.crate_rev(),
             "queue": self._queue_info(),
             "log": [{"t": t, "m": m} for (t, m) in self.controller.recent_events(14)],
+            "broadcast": {
+                "listeners": self.netcast.listeners() + self.netcast.ws_listeners(),
+                "url": f"http://{self._lan_ip}:{self.port}/listen",
+            },
         }
         # The full downloaded crate can be 100s of tracks (~30 KB JSON). Sending
         # it 3x/sec per client is needless GIL/serialisation load that competes
@@ -279,6 +349,8 @@ class Dashboard:
                 self._enqueue_url(url)
             else:
                 self.controller.log("[add]   ignored (need an http(s) link)")
+        elif cmd == "dig_similar":
+            self._dig_similar(int(value) if value >= 1 else 3)
         elif cmd == "queue_add":
             self.controller.queue_add(self._tid(payload))
         elif cmd == "queue_remove":
@@ -308,6 +380,12 @@ class Dashboard:
             self.mixer.start_audition(self.controller.crossfade_sec)
         elif cmd == "cue_audition_stop":
             self.mixer.stop_audition()
+        elif cmd == "cue_rescan":
+            # Re-enumerate audio devices (picks up AirPods connected after
+            # launch) and refresh the cache immediately so the next snapshot
+            # carries the new list.
+            self._cue_devices = self.mixer.rescan_devices()
+            self._cue_devices_ts = time.monotonic()
         # ---- drum-loop layer ("beats" pad) --------------------------------
         elif cmd == "beats_toggle":
             self.mixer.beats.toggle()
@@ -330,6 +408,8 @@ class Dashboard:
                 self.controller.log("[fx]    ignored (need an http(s) link)")
         elif cmd == "fx_trigger":
             self.mixer.fx.trigger(int(value))
+        elif cmd == "fx_loop":
+            self.mixer.fx.toggle_loop(int(value))
         elif cmd == "fx_level":
             self.mixer.fx.set_level(value)
         elif cmd == "fx_clear":
@@ -378,6 +458,91 @@ class Dashboard:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _dig_similar(self, count: int = 3) -> None:
+        """Auto-fetch `count` vibe-matched tracks seeded by the live song: the
+        scout pulls YouTube's Mix off the current track, keeps the on-tempo ones,
+        and splices them into the crate so the autopilot can pick them next. The
+        scout already worker-threads the slow network/analysis, so this returns
+        at once; progress shows in the decision log."""
+        if self.scout is None:
+            self.controller.log("[dig]   unavailable (this source can't take new tracks)")
+            return
+        self.scout.dig_now(count)
+
+    # ---- jukebox (LAN-guest requests) ------------------------------------
+    def jukebox_state(self) -> dict:
+        """What a /listen guest sees: the live track, the up-next queue, and the
+        loaded crate they can request from. Light enough to poll every few sec."""
+        live = self.controller.deck_tracks.get(self.mixer.current)
+        crate = [{"tid": t["tid"], "name": t["name"], "bpm": t["bpm"],
+                  "queued": t["queued"], "loaded": t["loaded"]}
+                 for t in self._buffer_info()]
+        return {
+            "now": (live.name if live else ""),
+            "queue": [{"name": q["name"], "bpm": q["bpm"]} for q in self._queue_info()],
+            "crate": crate,
+            "can_search": hasattr(self.library, "add_url"),
+        }
+
+    def jukebox_search(self, q: str) -> list[dict]:
+        """YouTube text search → [{vid, title}], metadata only (no download).
+        Runs in the request thread; ThreadingHTTPServer isolates the wait."""
+        q = q.strip()
+        if not q or not hasattr(self.library, "add_url"):
+            return []
+        from . import youtube_source as yt
+        try:
+            entries = yt.list_entries([f"ytsearch{_JUKEBOX_SEARCH_RESULTS}:{q}"],
+                                      limit=_JUKEBOX_SEARCH_RESULTS)
+        except Exception as exc:  # noqa: BLE001 - a failed search shouldn't 500
+            self.controller.log(f"[juke]  search failed: {exc}")
+            return []
+        return [{"vid": e["id"], "title": e["title"]} for e in entries]
+
+    def jukebox_request(self, tid: str = "", vid: str = "", title: str = "") -> dict:
+        """Handle a guest request. A crate `tid` queues instantly; a YouTube
+        `vid` downloads+analyses on a worker then queues. Auto-queue, no gate.
+        Returns {ok, msg} for the guest's toast."""
+        if tid:
+            t = self.controller._resolve_tid(self._tid({"tid": tid}))
+            if t is None:
+                return {"ok": False, "msg": "track not found"}
+            self.controller.queue_add(id(t))
+            self.controller.log(f"[juke]  guest queued {t.name[:34]}")
+            return {"ok": True, "msg": f"Queued “{t.name[:40]}”"}
+
+        vid = vid.strip()
+        if not vid or not hasattr(self.library, "add_url"):
+            return {"ok": False, "msg": "can't take that request"}
+        with self._jukebox_lock:
+            if vid in self._jukebox_inflight:
+                return {"ok": True, "msg": "already fetching that one…"}
+            if len(self._jukebox_inflight) >= _JUKEBOX_MAX_INFLIGHT:
+                return {"ok": False, "msg": "DJ's busy — try again in a moment"}
+            self._jukebox_inflight.add(vid)
+
+        url = f"https://www.youtube.com/watch?v={vid}"
+        label = (title or vid)[:40]
+
+        def work() -> None:
+            log = self.controller.log
+            log(f"[juke]  guest request: fetching {label} …")
+            try:
+                added = self.library.add_url(url, log=log)
+                for t in (added or []):
+                    self.controller.queue_add(id(t))
+                    log(f"[juke]  queued {t.name[:34]}  {t.bpm:.0f} BPM")
+                if not added:
+                    log(f"[juke]  nothing added for {label}")
+            except Exception as exc:  # noqa: BLE001 - surface, don't crash the server
+                log(f"[juke]  request failed: {exc}")
+            finally:
+                with self._jukebox_lock:
+                    self._jukebox_inflight.discard(vid)
+
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True, "msg": f"Queued “{label}” — fetching…"}
+
     def _enqueue_fx(self, url: str) -> None:
         """Download + trim a one-shot FX pad on a worker thread so the POST
         returns at once; the pad shows as 'loading' then 'ready' in the rack."""
@@ -419,11 +584,27 @@ class Dashboard:
                     else:
                         self._send(200, jpeg, "image/jpeg",
                                    {"Cache-Control": "no-store"})
+                elif path == "/listen":
+                    self._send(200, LISTEN_PAGE.encode(), "text/html; charset=utf-8")
+                elif path == "/ws-audio":
+                    self._serve_ws_audio()
+                elif path == "/stream.mp3":
+                    self._stream_audio()
+                elif path == "/jukebox":
+                    self._send(200, json.dumps(dashboard.jukebox_state()).encode(),
+                               "application/json")
+                elif path == "/jukebox/search":
+                    qs = parse_qs(urlsplit(self.path).query)
+                    q = (qs.get("q", [""])[0] or "")[:120]
+                    results = dashboard.jukebox_search(q)
+                    self._send(200, json.dumps({"results": results}).encode(),
+                               "application/json")
                 else:
                     self._send(404, b"not found")
 
             def do_POST(self):
-                if self.path.split("?", 1)[0] != "/control":
+                path = self.path.split("?", 1)[0]
+                if path not in ("/control", "/jukebox/request"):
                     self._send(404, b"not found")
                     return
                 length = int(self.headers.get("Content-Length", 0) or 0)
@@ -432,12 +613,84 @@ class Dashboard:
                     payload = json.loads(raw or b"{}")
                     if not isinstance(payload, dict):
                         raise ValueError("payload must be an object")
+                except (ValueError, TypeError):
+                    self._send(400, json.dumps({"ok": False}).encode(), "application/json")
+                    return
+                if path == "/jukebox/request":
+                    # Guest requests are auto-queued (no DJ gate). The control
+                    # channel stays separate so a guest can only touch the queue.
+                    res = dashboard.jukebox_request(
+                        tid=str(payload.get("tid", "")),
+                        vid=str(payload.get("vid", "")),
+                        title=str(payload.get("title", "")),
+                    )
+                    self._send(200, json.dumps(res).encode(), "application/json")
+                    return
+                try:
                     dashboard.handle_command(payload)
                     ok = True
                 except (ValueError, TypeError):
                     ok = False
                 self._send(200 if ok else 400,
                            json.dumps({"ok": ok}).encode(), "application/json")
+
+            def _serve_ws_audio(self):
+                """Low-latency raw-PCM stream over a WebSocket. Completes the
+                RFC6455 handshake by hand (stdlib has no WS server), then writes
+                each int16 block as one binary frame. The browser runs a tight
+                Web Audio jitter buffer, so this lands ~150-250ms behind the host
+                vs the ~1-3s of the MP3 <audio> path. We only ever send (never
+                read the client's frames), so no unmask logic is needed."""
+                key = self.headers.get("Sec-WebSocket-Key", "")
+                if self.headers.get("Upgrade", "").lower() != "websocket" or not key:
+                    self._send(400, b"expected a websocket upgrade")
+                    return
+                accept = base64.b64encode(
+                    hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
+                self.wfile.write(
+                    ("HTTP/1.1 101 Switching Protocols\r\n"
+                     "Upgrade: websocket\r\n"
+                     "Connection: Upgrade\r\n"
+                     "Sec-WebSocket-Accept: " + accept + "\r\n\r\n").encode())
+                self.wfile.flush()
+                # Past the handshake the socket is a raw WS pipe; don't let the
+                # base handler try to parse another HTTP request off it.
+                self.close_connection = True
+                client = dashboard.netcast.add_ws_client()
+                try:
+                    while not dashboard._stop.is_set():
+                        try:
+                            pcm = client.get(timeout=0.5)
+                        except queue.Empty:
+                            continue
+                        self.wfile.write(_ws_frame(pcm))
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                finally:
+                    dashboard.netcast.remove_ws_client(client)
+
+            def _stream_audio(self):
+                """Live MP3 of the master mix, for LAN listeners. Body is
+                delimited by connection close (no Content-Length), icecast-style:
+                we just keep writing encoded bytes until the client hangs up."""
+                client = dashboard.netcast.add_client()
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/mpeg")
+                self.send_header("Cache-Control", "no-cache, no-store")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                try:
+                    while not dashboard._stop.is_set():
+                        try:
+                            chunk = client.get(timeout=0.5)
+                        except queue.Empty:
+                            continue
+                        self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                finally:
+                    dashboard.netcast.remove_client(client)
 
             def _stream_events(self):
                 self.send_response(200)
@@ -468,6 +721,7 @@ class Dashboard:
 
     def stop(self) -> None:
         self._stop.set()
+        self.netcast.stop()
         if self._httpd is not None:
             self._httpd.shutdown()
             self._httpd.server_close()
@@ -515,6 +769,11 @@ PAGE = r"""<!doctype html>
   .live-pill{display:flex;align-items:center;gap:6px;border:1px solid var(--danger);border-radius:8px;
     padding:6px 11px;font-family:var(--f-mono);font-size:10px;letter-spacing:.14em;color:var(--danger);}
   .live-pill.live{border-color:var(--ok);color:var(--ok);}
+  .bcast-pill{display:flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:8px;
+    padding:6px 11px;font-family:var(--f-mono);font-size:10px;letter-spacing:.14em;color:var(--tf);
+    text-decoration:none;transition:color .2s,border-color .2s;}
+  .bcast-pill:hover{color:var(--td);border-color:var(--td);}
+  .bcast-pill.on{border-color:var(--deck-a);color:var(--deck-a);}
   .dot{width:6px;height:6px;border-radius:50%;background:currentColor;display:inline-block;flex:none;}
   .dot-ok{background:var(--ok);} .dot-live{background:var(--danger);} .dot-faint{background:var(--tf);}
 
@@ -672,6 +931,9 @@ PAGE = r"""<!doctype html>
     color:var(--deck-a);background:#0C2630;border:1px solid var(--deck-a-dim);border-radius:8px;padding:8px 13px;
     transition:border-color .15s,transform .05s;}
   .add-btn:hover{border-color:var(--deck-a);} .add-btn:active{transform:translateY(1px);}
+  .dig-btn{color:var(--deck-b);background:#261A0C;border-color:var(--deck-b-dim);white-space:nowrap;}
+  .dig-btn:hover{border-color:var(--deck-b);}
+  .dig-btn:disabled{opacity:.55;cursor:default;color:var(--tf);border-color:var(--border);}
   .cards{display:flex;gap:12px;}
   .card{flex:1;min-width:0;display:flex;flex-direction:column;gap:12px;padding:14px;border-radius:12px;
     background:var(--bg-raised);border:1px solid var(--border);}
@@ -777,8 +1039,15 @@ PAGE = r"""<!doctype html>
     border:1px solid var(--border);border-radius:6px;padding:3px 7px;}
   .cue-state.on{color:var(--ok);border-color:var(--ok);}
   .cue-state.aud{color:var(--accent);border-color:var(--accent);}
-  .cue-dev{width:100%;background:var(--bg-raised);color:var(--tp);border:1px solid var(--border);
+  .cue-devrow{display:flex;gap:8px;align-items:stretch;}
+  .cue-dev{flex:1;min-width:0;background:var(--bg-raised);color:var(--tp);border:1px solid var(--border);
     border-radius:7px;padding:7px 9px;font-family:var(--f-body);font-size:12px;}
+  .cue-rescan{flex:0 0 auto;background:var(--bg-raised);color:var(--td);border:1px solid var(--border);
+    border-radius:7px;padding:0 11px;font-size:14px;line-height:1;cursor:pointer;
+    transition:background .12s,color .12s,border-color .12s;}
+  .cue-rescan:hover{border-color:var(--td);color:var(--tp);}
+  .cue-rescan.spin{animation:cue-spin .6s linear;}
+  @keyframes cue-spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
   .cue-row2{display:flex;gap:8px;align-items:center;}
   .cue-src{display:flex;flex:1;gap:0;border:1px solid var(--border);border-radius:7px;overflow:hidden;}
   .cue-src button{flex:1;background:transparent;color:var(--td);border:none;border-right:1px solid var(--border);
@@ -854,8 +1123,9 @@ PAGE = r"""<!doctype html>
   .fx-row1 input::placeholder{color:var(--tf);}
   .fx-add{background:var(--accent);color:#fff;border:none;border-radius:7px;padding:0 14px;height:34px;
     font-family:var(--f-mono);font-size:10px;letter-spacing:.1em;cursor:pointer;}
-  .fx-pads{display:grid;grid-template-columns:repeat(2,1fr);gap:6px;min-height:6px;}
-  .fx-pad{display:flex;align-items:center;gap:7px;background:var(--bg-raised);border:1px solid var(--border);
+  .fx-pads{display:grid;grid-template-columns:repeat(2,1fr);gap:6px;min-height:6px;
+    max-height:208px;overflow-y:auto;}
+  .fx-pad{display:flex;align-items:center;gap:6px;background:var(--bg-raised);border:1px solid var(--border);
     border-radius:7px;padding:8px 9px;cursor:pointer;transition:background .1s,box-shadow .1s,border-color .1s;}
   .fx-pad .fx-nm{flex:1;min-width:0;font-family:var(--f-body);font-size:11px;color:var(--tp);
     white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
@@ -863,8 +1133,14 @@ PAGE = r"""<!doctype html>
   .fx-pad.ready:hover{border-color:var(--accent);}
   .fx-pad.ready:active,.fx-pad.firing{background:var(--accent);border-color:var(--accent);box-shadow:0 0 14px var(--accent);}
   .fx-pad.firing .fx-nm,.fx-pad.firing .fx-dur{color:#fff;}
+  .fx-pad.looping{border-color:var(--accent);}
   .fx-pad.loading{opacity:.6;cursor:default;}
   .fx-pad.loading .fx-dur{color:var(--warn);}
+  .fx-lp{flex:none;width:16px;height:16px;border-radius:4px;border:1px solid var(--border);background:transparent;
+    color:var(--tf);font-size:11px;line-height:1;cursor:pointer;padding:0;}
+  .fx-lp:hover{color:var(--accent);border-color:var(--accent);}
+  .fx-lp.on{color:#fff;background:var(--accent);border-color:var(--accent);}
+  .fx-pad.firing .fx-lp.on{background:#fff;color:var(--accent);border-color:#fff;}
   .fx-x{flex:none;width:16px;height:16px;border-radius:4px;border:1px solid var(--border);background:transparent;
     color:var(--tf);font-size:11px;line-height:1;cursor:pointer;padding:0;}
   .fx-x:hover{color:var(--danger);border-color:var(--danger);}
@@ -1089,6 +1365,9 @@ PAGE = r"""<!doctype html>
       <div class="tstat"><span class="tstat-l">IN ROTATION</span><span class="tstat-v" id="rotation">0 TRACKS</span></div>
       <button class="transport" id="playpause" onclick="send('pause')">
         <span class="pp-ic" id="pp-ic">&#9208;</span><span id="pp-txt">PAUSE</span></button>
+      <a class="bcast-pill" id="bcast-pill" href="/listen" target="_blank" title="Open the listen page on this or any Mac/phone on the Wi-Fi">
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><path d="M4.9 4.9a10 10 0 0 0 0 14.2M19.1 4.9a10 10 0 0 1 0 14.2M7.8 7.8a6 6 0 0 0 0 8.5M16.2 7.8a6 6 0 0 1 0 8.5"/><circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"/></svg>
+        <span id="bcast-txt">LAN OFF</span></a>
       <div class="live-pill" id="live-pill"><span class="dot" id="live-dot"></span><span id="live-txt">CONNECTING</span></div>
     </div>
   </div>
@@ -1210,6 +1489,7 @@ PAGE = r"""<!doctype html>
           <button data-tk="cut"       onclick="post({cmd:'transition_kind',kind:'cut'})">CUT</button>
           <button data-tk="echo"      onclick="post({cmd:'transition_kind',kind:'echo'})">ECHO</button>
           <button data-tk="brake"     onclick="post({cmd:'transition_kind',kind:'brake'})">BRAKE</button>
+          <button data-tk="morph"     onclick="post({cmd:'transition_kind',kind:'morph'})">MORPH</button>
         </div>
       </div>
 
@@ -1218,9 +1498,12 @@ PAGE = r"""<!doctype html>
           <span class="cue-ttl"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/></svg>MONITOR</span>
           <span class="cue-state" id="cue-state">OFF</span>
         </div>
-        <select class="cue-dev" id="cue-dev" onchange="post({cmd:'cue_device', device:this.value})">
-          <option value="off">— monitor off —</option>
-        </select>
+        <div class="cue-devrow">
+          <select class="cue-dev" id="cue-dev" onchange="post({cmd:'cue_device', device:this.value})">
+            <option value="off">— monitor off —</option>
+          </select>
+          <button class="cue-rescan" id="cue-rescan" title="Re-scan audio devices (pick up AirPods/headphones connected after launch)" onclick="cueRescan()">⟳</button>
+        </div>
         <div class="cue-row2">
           <div class="cue-src" id="cue-src">
             <button data-src="cued" onclick="post({cmd:'cue_source',source:'cued'})">CUED</button>
@@ -1276,7 +1559,7 @@ PAGE = r"""<!doctype html>
       <div class="fxpanel">
         <div class="fx-head">
           <span class="fx-ttl">FX RACK</span>
-          <span class="fx-hint" id="fx-hint">paste a link → one-shot pad</span>
+          <span class="fx-hint" id="fx-hint">paste a link → loopable pad · saved</span>
         </div>
         <div class="fx-row1">
           <input id="fx-url" type="text" spellcheck="false"
@@ -1424,6 +1707,8 @@ PAGE = r"""<!doctype html>
                placeholder="paste a YouTube link to queue it…"
                onkeydown="if(event.key==='Enter')addUrl()">
         <button class="add-btn" onclick="addUrl()">+ ADD</button>
+        <button class="add-btn dig-btn" onclick="digSimilar(this)"
+                title="auto-fetch 3 tracks that fit what's playing now">&#9733; DIG&nbsp;3</button>
       </div>
     </div>
     <div class="queue-list" id="queue-list"></div>
@@ -1527,13 +1812,15 @@ function updateMeter(id,val){
   const lit=Math.round(Math.max(0,Math.min(1,val))*20), segs=$(id).children;
   for(let i=0;i<20;i++) segs[i].style.background = i<lit ? segColor(i) : "var(--seg-off)";
 }
-function buildWave(id,seed){
-  const c=$(id); c.innerHTML=""; let r=seed>>>0;
-  const rnd=()=>{ r=(r*1103515245+12345)&0x7fffffff; return r/0x7fffffff; };
-  for(let i=0;i<64;i++){
-    const t=i/63;
-    const env=0.3+0.7*Math.abs(Math.sin(t*Math.PI*3))*(0.6+0.4*Math.abs(Math.cos(t*Math.PI*7)));
-    const h=Math.max(5,Math.round(env*52*(0.6+0.5*rnd())));
+// Build the waveform bars from the track's REAL peak envelope (0..1 per bin),
+// sent by the engine. With no envelope (idle deck) draw a flat baseline.
+function buildWave(id,env){
+  const c=$(id); if(!c) return;
+  const arr = (env && env.length) ? env : new Array(64).fill(0.08);
+  const H = (c.clientHeight||60) - 6;
+  c.innerHTML="";
+  for(let i=0;i<arr.length;i++){
+    const h=Math.max(3, Math.round(Math.max(0,Math.min(1,arr[i]))*H));
     const b=document.createElement("span"); b.style.height=h+"px"; c.appendChild(b);
   }
 }
@@ -1559,6 +1846,11 @@ function deck(p, d){
   $(p+"-dur").textContent = fmt(d.duration);
   $(p+"-mid").textContent = d.role==="live" ? "−"+fmt(d.remaining)+" TO MIX"
                           : (d.role==="cued" ? "CUE READY" : "");
+
+  // Rebuild the waveform bars only when the track (its real envelope) changes,
+  // so an open render isn't clobbered every frame.
+  const wsig = (d.wave && d.wave.length) ? d.title+"|"+d.wave.length : "";
+  if(wsig !== waveSig[p]){ waveSig[p]=wsig; buildWave(p+"-wave", d.wave); }
 
   // Phrase cue markers over the waveform: drag them to hand-set where the mix
   // drops (IN) and where the outgoing track starts its fade (OUT). A ✎ flag
@@ -1638,6 +1930,13 @@ function render(s){
   $("crowd-meter-lab").textContent = crowdManual
     ? "VIBE · DRAG TO SET · ROOM "+(s.crowd.sensor||0).toFixed(2) : "CROWD";
   $("mode-tag").textContent = crowdManual ? "MANUAL · DJ-STEERED" : "AUTOPILOT · CROWD-STEERED";
+  const bc=s.broadcast;
+  if(bc){
+    const bp=$("bcast-pill"), n=bc.listeners||0;
+    bp.href = bc.url;
+    bp.classList.toggle("on", n>0);
+    $("bcast-txt").textContent = n>0 ? ("ON AIR · "+n+(n===1?" EAR":" EARS")) : "LISTEN ↗";
+  }
   // While the DJ is dragging the fader, don't let the SSE frame fight the grab.
   if(!draggingVibe){
     $("crowd-big").textContent = ce.toFixed(2);
@@ -1776,7 +2075,9 @@ function renderBeats(b){
 // ---- sound-FX rack ----------------------------------------------------
 // Paste a link → the server downloads + trims a one-shot on a worker thread;
 // the pad appears as LOADING then becomes a TRIGGER button. Tap to fire it over
-// the live mix; the × clears it. The FX fader sets the rack's master level.
+// the live mix; the ⟳ latches it into an endless loop (tap the pad again to
+// stop); the × removes it from the library. Loaded effects persist and reload
+// as pads on restart. The FX fader sets the rack's master level.
 let _fxFire = {};                              // slot index -> ms to keep lit
 function fxAdd(){
   const el = $("fx-url"), u = el.value.trim();
@@ -1789,6 +2090,9 @@ function fxTrigger(i){
   const pad = document.querySelector('.fx-pad[data-fi="'+i+'"]');
   if(pad) pad.classList.add("firing");
   post({cmd:"fx_trigger", value:i});
+}
+function fxLoop(i){                             // latch/unlatch endless loop mode
+  post({cmd:"fx_loop", value:i});
 }
 function renderFx(f){
   const lvl = (f.level==null?0.8:f.level);
@@ -1804,13 +2108,17 @@ function renderFx(f){
     pads.innerHTML = slots.map((s,i)=>{
       const ld = s.status==="loading";
       const fire = (s.active || (_fxFire[i]||0)>now) ? " firing" : "";
-      const cls = ld ? "loading" : (s.status==="ready" ? "ready"+fire : "");
+      const loop = s.loop ? " looping" : "";
+      const cls = ld ? "loading" : (s.status==="ready" ? "ready"+fire+loop : "");
       const tag = ld ? "LOAD…" : (s.dur?s.dur.toFixed(1)+"s":"");
       const nm = (s.name||"clip").replace(/</g,"&lt;");
       const onclk = ld ? "" : ' onclick="fxTrigger('+i+')"';
+      const lpbtn = ld ? "" : ('<button class="fx-lp'+(s.loop?" on":"")+'" title="loop"'
+        + ' onclick="event.stopPropagation();fxLoop('+i+')">&#8635;</button>');
       return '<div class="fx-pad '+cls+'" data-fi="'+i+'"'+onclk+'>'
         + '<span class="fx-nm">'+nm+'</span>'
         + '<span class="fx-dur">'+tag+'</span>'
+        + lpbtn
         + '<button class="fx-x" title="clear" onclick="event.stopPropagation();post({cmd:\'fx_clear\',value:'+i+'})">&times;</button>'
         + '</div>';
     }).join("");
@@ -1871,6 +2179,11 @@ function melAuto(){ post({cmd:"melody_autotune", value:(_mel.autotune?0:1)}); }
 // Mirror the engine's cue state into the panel: device dropdown (rebuilt only
 // when the device set changes, so an open menu / picked value isn't clobbered),
 // source toggle, level fader, and the AUDITION button + progress bar.
+function cueRescan(){
+  const b=$("cue-rescan");
+  if(b){ b.classList.remove("spin"); void b.offsetWidth; b.classList.add("spin"); }
+  post({cmd:"cue_rescan"});
+}
 function renderCue(c, devs){
   const sig = devs.map(d=>d.index+":"+d.name).join("|");
   if(sig !== cueDevSig){
@@ -1929,6 +2242,15 @@ function addUrl(){
   setTimeout(()=>{ el.placeholder="paste a YouTube link to queue it…"; }, 5000);
 }
 
+// Auto-fetch 3 tracks that fit what's playing: seeds YouTube's Mix off the live
+// song, keeps the on-tempo ones, lines them up in the crate. Slow work happens
+// server-side on a worker thread — watch the log for "[scout] +…".
+function digSimilar(btn){
+  post({cmd:"dig_similar", value:3});
+  if(btn){ const o=btn.innerHTML; btn.innerHTML="DIGGING…"; btn.disabled=true;
+    setTimeout(()=>{ btn.innerHTML=o; btn.disabled=false; }, 6000); }
+}
+
 // ---- manual DJ queue ---------------------------------------------------
 // tid is id(track) as a string — sent back verbatim so the server matches by
 // identity (names collide; floats lose precision). queue_move value: -1 up, +1 down.
@@ -1969,6 +2291,7 @@ let jogging={A:false, B:false};
 // the last server value (which lags the grab). Cleared on pointer release.
 let cueDrag={A:{in:false,out:false}, B:{in:false,out:false}};
 let cueAud=false;            // is the monitor currently auditioning a transition
+let waveSig={A:"",B:""};     // per-deck waveform signature, to rebuild only on track change
 let cueDevSig="";            // signature of the device list, to avoid rebuilding
 function setAnim(p, d){
   anim[p] = {
@@ -2197,7 +2520,7 @@ function vibeSet(ev){
   m.addEventListener("pointercancel", end);
 })();
 
-buildWave("A-wave", 0x51ED); buildWave("B-wave", 0xB0A7);
+buildWave("A-wave"); buildWave("B-wave");
 buildMeter("crowd-segs"); buildMeter("target-segs");
 ["A","B"].forEach(p=>["high","mid","low"].forEach(b=>initKnob(p+"-eq-"+b)));
 
@@ -2215,6 +2538,268 @@ function connect(){
   es.onerror = () => { const p=$("live-pill"); p.classList.remove("live"); $("live-txt").textContent="OFFLINE"; };
 }
 connect();
+</script>
+</body>
+</html>
+"""
+
+
+# Listener page served at GET /listen — a single <audio> tuned to the live MP3
+# at /stream.mp3. No SSE, no controls, no dependencies: paste the LAN URL on any
+# Mac/phone/tablet on the same Wi-Fi and press play. The encoder only spins up
+# once this page (or any client) opens the stream.
+LISTEN_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vibe-dj · live</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Saira+Semi+Condensed:wght@600;700&family=Space+Mono&display=swap" rel="stylesheet">
+<style>
+  :root{--bg:#0A0C10;--panel:#12151C;--raised:#1A1F29;--border:#262C38;--a:#27C3F2;--tp:#E8EDF4;
+    --td:#7A8699;--tf:#4A5568;--ok:#3DD68C;--warn:#F59E0B;
+    --disp:"Saira Semi Condensed","Arial Narrow",system-ui,sans-serif;--mono:"Space Mono",ui-monospace,Menlo,monospace;}
+  *{box-sizing:border-box;}
+  body{margin:0;min-height:100vh;background:radial-gradient(120% 70% at 50% 0%,#11161F 0%,var(--bg) 55%);
+    color:var(--tp);font-family:var(--disp);display:flex;justify-content:center;padding:20px;}
+  .wrap{width:100%;max-width:460px;display:flex;flex-direction:column;gap:16px;}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:20px;padding:28px 26px;text-align:center;}
+  .logo{color:var(--a);display:flex;justify-content:center;margin-bottom:12px;}
+  h1{font-weight:700;font-size:27px;letter-spacing:.06em;margin:0;}
+  .sub{font-family:var(--mono);font-size:11px;letter-spacing:.18em;color:var(--td);margin:7px 0 22px;}
+  audio{width:100%;outline:none;}
+  .golive{width:100%;margin-top:4px;background:var(--a);color:var(--bg);border:none;border-radius:12px;
+    font-family:var(--disp);font-weight:700;font-size:18px;letter-spacing:.07em;padding:16px;cursor:pointer;
+    transition:transform .06s,opacity .2s;}
+  .golive:active{transform:scale(.98);}
+  .status{display:flex;align-items:center;justify-content:center;gap:8px;font-family:var(--mono);
+    font-size:11px;letter-spacing:.14em;color:var(--tf);margin-top:20px;}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--tf);}
+  .status.on{color:var(--ok);} .status.on .dot{background:var(--ok);box-shadow:0 0 8px var(--ok);}
+  .status.live{color:var(--a);} .status.live .dot{background:var(--a);box-shadow:0 0 8px var(--a);}
+  .lat{font-family:var(--mono);font-size:10px;letter-spacing:.12em;color:var(--td);margin-top:9px;min-height:13px;}
+  .note{font-family:var(--mono);font-size:10px;letter-spacing:.06em;color:var(--tf);margin-top:16px;line-height:1.6;}
+  .compat{margin-top:18px;text-align:left;border-top:1px solid var(--border);padding-top:14px;}
+  .compat summary{font-family:var(--mono);font-size:10px;letter-spacing:.1em;color:var(--tf);cursor:pointer;
+    list-style:none;text-align:center;}
+  .compat summary::-webkit-details-marker{display:none;}
+  .compat[open] summary{margin-bottom:13px;color:var(--td);}
+
+  /* jukebox */
+  .juke{background:var(--panel);border:1px solid var(--border);border-radius:20px;padding:22px 20px;}
+  .jhead{font-weight:700;font-size:17px;letter-spacing:.1em;margin:0 0 3px;}
+  .now{font-family:var(--mono);font-size:11px;letter-spacing:.04em;color:var(--td);margin-bottom:16px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .now b{color:var(--a);font-weight:400;}
+  .tabs{display:flex;gap:8px;margin-bottom:14px;}
+  .tab{flex:1;font-family:var(--mono);font-size:11px;letter-spacing:.12em;color:var(--td);
+    background:var(--raised);border:1px solid var(--border);border-radius:9px;padding:10px;cursor:pointer;}
+  .tab.on{color:var(--bg);background:var(--a);border-color:var(--a);font-weight:700;}
+  .pane{display:none;} .pane.on{display:block;}
+  .srow{display:flex;gap:8px;margin-bottom:12px;}
+  .srow input{flex:1;min-width:0;background:var(--bg);border:1px solid var(--border);border-radius:9px;
+    color:var(--tp);font-family:var(--disp);font-size:15px;padding:11px 13px;outline:none;}
+  .srow input:focus{border-color:var(--a);}
+  .srow button{background:var(--a);color:var(--bg);border:none;border-radius:9px;font-family:var(--mono);
+    font-size:12px;font-weight:700;letter-spacing:.1em;padding:0 16px;cursor:pointer;}
+  .list{list-style:none;margin:0;padding:0;max-height:260px;overflow-y:auto;-webkit-overflow-scrolling:touch;}
+  .row{display:flex;align-items:center;gap:10px;padding:10px 4px;border-bottom:1px solid var(--border);}
+  .row:last-child{border-bottom:none;}
+  .rtxt{flex:1;min-width:0;}
+  .rname{font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .rmeta{font-family:var(--mono);font-size:9px;letter-spacing:.1em;color:var(--tf);margin-top:2px;}
+  .add{flex:none;width:36px;height:36px;border-radius:9px;background:var(--raised);border:1px solid var(--border);
+    color:var(--a);font-size:22px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;}
+  .add:active{transform:scale(.9);}
+  .add.done{color:var(--ok);border-color:var(--ok);background:transparent;}
+  .empty{font-family:var(--mono);font-size:11px;letter-spacing:.06em;color:var(--tf);text-align:center;padding:18px 0;}
+  .qhead{font-family:var(--mono);font-size:10px;letter-spacing:.16em;color:var(--tf);margin:18px 0 8px;}
+  .qrow{font-size:14px;color:var(--td);padding:6px 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .qrow .qn{font-family:var(--mono);font-size:10px;color:var(--tf);margin-right:8px;}
+  .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(20px);opacity:0;
+    background:var(--a);color:var(--bg);font-family:var(--mono);font-size:12px;letter-spacing:.04em;font-weight:700;
+    padding:12px 18px;border-radius:11px;max-width:90vw;text-align:center;transition:opacity .25s,transform .25s;
+    pointer-events:none;z-index:9;}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+  .toast.warn{background:var(--warn);}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="logo"><svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.4" fill="currentColor" stroke="none"/></svg></div>
+      <h1>LIVE FROM THE DJ</h1>
+      <div class="sub">STREAMING OVER WI-FI</div>
+      <button class="golive" id="golive" onclick="goLive()">▶ TAP TO GO LIVE</button>
+      <div class="status" id="status"><span class="dot"></span><span id="status-txt">TAP TO LISTEN</span></div>
+      <div class="lat" id="lat"></div>
+      <div class="note">Low-latency — rides within ~0.2s of the room.</div>
+      <details class="compat">
+        <summary>Trouble hearing it? Compatibility mode ▾</summary>
+        <audio id="a" controls playsinline preload="none" src="/stream.mp3"></audio>
+        <div class="note">Plays anywhere, but runs ~1-3s behind the room.</div>
+      </details>
+    </div>
+
+    <div class="juke">
+      <div class="jhead">REQUEST A TRACK</div>
+      <div class="now" id="now">—</div>
+      <div class="tabs">
+        <div class="tab on" id="tab-search" onclick="tab('search')">SEARCH</div>
+        <div class="tab" id="tab-crate" onclick="tab('crate')">IN THE CRATE</div>
+      </div>
+      <div class="pane on" id="pane-search">
+        <form class="srow" onsubmit="search();return false;">
+          <input id="q" type="search" placeholder="song or artist…" autocomplete="off">
+          <button type="submit" onclick="search();return false;">GO</button>
+        </form>
+        <ul class="list" id="results"><li class="empty">search to request anything</li></ul>
+      </div>
+      <div class="pane" id="pane-crate">
+        <ul class="list" id="crate"><li class="empty">loading crate…</li></ul>
+      </div>
+      <div class="qhead">UP NEXT</div>
+      <div id="queue"><div class="empty">nothing queued yet — be the first</div></div>
+    </div>
+  </div>
+  <div class="toast" id="toast"></div>
+<script>
+  const $=id=>document.getElementById(id);
+  const a=$("a"), st=$("status"), tx=$("status-txt");
+  function setStatus(cls,t){ st.classList.remove("on","live"); if(cls) st.classList.add(cls); tx.textContent=t; }
+
+  /* ---- low-latency player: raw int16 PCM over a WebSocket, scheduled through
+     the Web Audio clock with a tight jitter buffer we control (~120ms), so this
+     lands ~0.2s behind the host instead of the ~1-3s of the MP3 <audio> path. */
+  const SR=44100, CH=2, TARGET=0.12, CEIL=0.40;
+  let ctx=null, ws=null, nextTime=0, playing=false, gotAudio=false, reconnectT=null, latT=0;
+  function goLive(){
+    if(playing) return;
+    playing=true; $("golive").style.display="none";
+    setStatus("","CONNECTING…");
+    const AC=window.AudioContext||window.webkitAudioContext;
+    try{ ctx=new AC({sampleRate:SR,latencyHint:"interactive"}); }
+    catch(_){ ctx=new AC(); }
+    ctx.resume();           // the tap satisfies the browser autoplay gesture
+    connectWS();
+  }
+  function connectWS(){
+    nextTime=0; gotAudio=false;
+    const proto=(location.protocol==="https:"?"wss":"ws");
+    ws=new WebSocket(proto+"://"+location.host+"/ws-audio");
+    ws.binaryType="arraybuffer";
+    ws.onmessage=onPCM;
+    ws.onclose=onWSClose;
+    ws.onerror=()=>{};      // onclose fires right after; reconnect handled there
+  }
+  function onWSClose(){
+    if(!playing) return;
+    setStatus("","RECONNECTING…");
+    clearTimeout(reconnectT); reconnectT=setTimeout(connectWS,800);
+  }
+  function onPCM(ev){
+    if(!(ev.data instanceof ArrayBuffer) || !ctx) return;
+    const i16=new Int16Array(ev.data), frames=(i16.length/CH)|0;
+    if(frames<=0) return;
+    const now=ctx.currentTime;
+    // Overbuffered (a burst arriving after a network stall): drop this block so
+    // playback snaps back toward live instead of accumulating delay — the clock
+    // keeps moving, so the lead shrinks until we're back under the ceiling.
+    if(nextTime > now+CEIL) return;
+    const buf=ctx.createBuffer(CH,frames,SR);
+    const l=buf.getChannelData(0), r=buf.getChannelData(1);
+    for(let i=0;i<frames;i++){ l[i]=i16[i*2]/32768; r[i]=i16[i*2+1]/32768; }
+    // Underrun / first block: (re)build the cushion ahead of the playhead.
+    if(nextTime < now+0.02) nextTime=now+TARGET;
+    const src=ctx.createBufferSource(); src.buffer=buf; src.connect(ctx.destination);
+    src.start(nextTime); nextTime+=buf.duration;
+    if(!gotAudio){ gotAudio=true; setStatus("live","ON AIR"); }
+    const t=performance.now();
+    if(t-latT>500){ latT=t;
+      const out=(ctx.outputLatency||ctx.baseLatency||0);
+      $("lat").textContent="≈ "+Math.max(0,Math.round((nextTime-now+out)*1000))+" ms behind live";
+    }
+  }
+  /* compat MP3 <audio> uses its own native controls; only let it drive the
+     shared status when the listener hasn't gone live on the low-latency path. */
+  a.addEventListener("playing", ()=>{ if(!playing) setStatus("on","ON AIR · COMPAT"); });
+  a.addEventListener("waiting", ()=>{ if(!playing) setStatus("","BUFFERING…"); });
+  a.addEventListener("error",   ()=>{ if(!playing) setStatus("","NO SIGNAL — IS THE SET LIVE?"); });
+
+  let toastT;
+  function toast(msg,warn){
+    const el=$("toast"); el.textContent=msg; el.classList.toggle("warn",!!warn); el.classList.add("show");
+    clearTimeout(toastT); toastT=setTimeout(()=>el.classList.remove("show"),2600);
+  }
+  function tab(name){
+    ["search","crate"].forEach(n=>{
+      $("tab-"+n).classList.toggle("on",n===name);
+      $("pane-"+n).classList.toggle("on",n===name);
+    });
+  }
+  async function request(body,btn){
+    if(btn){ btn.disabled=true; }
+    try{
+      const r=await fetch("/jukebox/request",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+      const j=await r.json();
+      toast(j.msg||(j.ok?"queued":"couldn't queue"), !j.ok);
+      if(j.ok && btn){ btn.textContent="✓"; btn.classList.add("done"); }
+      else if(btn){ btn.disabled=false; }
+      poll();
+    }catch(_){ toast("network error",true); if(btn) btn.disabled=false; }
+  }
+  function esc(s){ return (s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+  let searchT;
+  async function search(){
+    const q=$("q").value.trim(); if(!q) return;
+    const ul=$("results"); ul.innerHTML='<li class="empty">searching…</li>';
+    try{
+      const r=await fetch("/jukebox/search?q="+encodeURIComponent(q));
+      const j=await r.json(); const res=j.results||[];
+      if(!res.length){ ul.innerHTML='<li class="empty">no matches</li>'; return; }
+      ul.innerHTML="";
+      res.forEach(x=>{
+        const li=document.createElement("li"); li.className="row";
+        li.innerHTML='<div class="rtxt"><div class="rname">'+esc(x.title)+'</div><div class="rmeta">YOUTUBE</div></div>'
+          +'<button class="add">＋</button>';
+        li.querySelector(".add").onclick=e=>request({vid:x.vid,title:x.title},e.currentTarget);
+        ul.appendChild(li);
+      });
+    }catch(_){ ul.innerHTML='<li class="empty">search failed</li>'; }
+  }
+
+  function renderCrate(crate){
+    const ul=$("crate");
+    if(!crate||!crate.length){ ul.innerHTML='<li class="empty">crate is empty</li>'; return; }
+    ul.innerHTML="";
+    crate.forEach(t=>{
+      const li=document.createElement("li"); li.className="row";
+      const meta=(t.bpm?t.bpm.toFixed(0)+" BPM":"")+(t.loaded?" · ON DECK":(t.queued?" · QUEUED":""));
+      const done=t.queued||t.loaded;
+      li.innerHTML='<div class="rtxt"><div class="rname">'+esc(t.name)+'</div><div class="rmeta">'+meta+'</div></div>'
+        +'<button class="add'+(done?" done":"")+'">'+(done?"✓":"＋")+'</button>';
+      const b=li.querySelector(".add");
+      if(done){ b.disabled=true; } else { b.onclick=e=>request({tid:t.tid},e.currentTarget); }
+      ul.appendChild(li);
+    });
+  }
+  function renderQueue(q){
+    const box=$("queue");
+    if(!q||!q.length){ box.innerHTML='<div class="empty">nothing queued yet — be the first</div>'; return; }
+    box.innerHTML=q.map((x,i)=>'<div class="qrow"><span class="qn">'+(i+1)+'</span>'+esc(x.name)+'</div>').join("");
+  }
+
+  async function poll(){
+    try{
+      const r=await fetch("/jukebox"); const s=await r.json();
+      $("now").innerHTML = s.now ? ('NOW PLAYING · <b>'+esc(s.now)+'</b>') : 'NOTHING PLAYING';
+      renderCrate(s.crate); renderQueue(s.queue);
+      if(!s.can_search){ $("tab-search").style.display="none"; tab("crate"); }
+    }catch(_){}
+  }
+  poll(); setInterval(poll,3500);
 </script>
 </body>
 </html>

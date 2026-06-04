@@ -10,6 +10,52 @@ next track to match where the room is heading, beatmatches it, and crossfades.
 Repo: https://github.com/sameeeeeeep/vibe-dj (public, MIT)
 
 ## ✅ DONE (recent)
+- **LAN audio broadcast (listen on other Macs/phones over Wi-Fi)** — `dj/netcast.py` `NetCast`,
+  two delivery paths sharing one realtime-safe `feed()` (called from the audio callback; drops a
+  block rather than ever stalling audio). Tapped in `mixer.mix()` (`self.netcast`). `main.py --lan`
+  binds `0.0.0.0` + prints the LAN URL (also exposes the control UI — warned at startup; trusted
+  Wi-Fi only). `_lan_ip()` finds the route-out address via a UDP connect (no packets). Topbar/
+  listen-page ON-AIR badge sums both paths' listener counts (`snapshot()['broadcast']`).
+  `.claude/launch.json` dj-youtube adds `--lan`.
+  - **Low-latency (preferred): raw int16 PCM over a WebSocket.** `feed()` converts the float32
+    block to little-endian int16 and fans it to each WS listener (lock-free `_ws_snapshot`, short
+    `_WS_BACKLOG=16` drop-oldest queue → snap-to-live, no encoder cost). Dashboard `GET /ws-audio`
+    does the RFC6455 handshake by hand (stdlib has no WS server; SHA1+base64 accept-key, `_WS_GUID`)
+    then writes each block as one unmasked binary frame (`_ws_frame`, opcode 0x82; we only ever
+    send). The `/listen` page leads with a **"TAP TO GO LIVE"** Web Audio player (`goLive`/`onPCM`):
+    decodes int16→float32 into `AudioBuffer`s scheduled against `AudioContext.currentTime` with a
+    tight jitter buffer (`TARGET=0.12s`, `CEIL=0.40s`); underrun rebuilds the cushion, overbuffer
+    drops a block to snap back. Auto-reconnect on WS close; live "≈ N ms behind live" readout.
+    Verified live (headless Chromium): handshake → 101, PCM flows continuously, ~190-227 ms behind,
+    no clicks, no console errors, listener count = 1.
+  - **Compatibility fallback: MP3.** A persistent ffmpeg (`f32le → mp3 192k`) encodes the same PCM;
+    icecast-style HTTP fan-out, one drop-oldest queue per listener; encoder spins up only while ≥1
+    MP3 listener is connected, tears down on the last disconnect. `GET /stream.mp3` (Connection:
+    close, no Content-Length, body delimited by hangup). Demoted on `/listen` to a collapsed
+    "compatibility mode" `<details>` (`preload="none"` so ffmpeg only starts if actually used).
+    ~1-3 s behind, not phase-locked — fine for filling another room. Verified live: emits real MP3
+    (ID3 + MPEG frames, ~192k). Tight sample-locked multi-room sync would still need Snapcast.
+- **Jukebox (LAN guests request tracks into the queue)** — the `/listen` page carries a REQUEST
+  panel: a YouTube **search** box (`GET /jukebox/search?q=` → `youtube_source.list_entries`
+  `ytsearchN:`, metadata only, no download) AND a browsable **loaded-crate** list, plus an UP NEXT
+  view, all polling `GET /jukebox` (`Dashboard.jukebox_state()`). A pick POSTs `/jukebox/request`
+  (`Dashboard.jukebox_request`): a crate `tid` calls `controller.queue_add(id(t))` instantly
+  (disk-safe, no download); a YouTube `vid` worker-threads `library.add_url(url)` then
+  `queue_add` each result. **Auto-queue, no DJ approval gate** (user's choice). Guardrails honoring
+  the tight disk: `_JUKEBOX_MAX_INFLIGHT=4` concurrent downloads + dedupe by video id (returns
+  "already fetching"/"DJ's busy"). Verified live: crate request lands in up-next, search returns 6
+  hits, vid request downloads+queues, dedupe fires, toast + ✓ states render on the page.
+- **Self-cleaning runtime downloads (folder mode)** — guest/auto-dig YouTube tracks no longer pile
+  up in `yt_cache`. `dj/library.py`: any track whose filename carries an 11-char YouTube id
+  (`_VID_RE`) is added through `add_analyzed()` as `Track.ephemeral=True` and recorded in
+  `yt_library_manifest.json` (merge-by-id, beside the cache folder = repo root, matching
+  `tools/redownload_library.py`). `release()` (was a no-op) now deletes the on-disk file + drops the
+  track once it has actually played — gated on `play_count >= 1` so a cued-but-unplayed request the
+  controller *unstages* (which decrements play_count to 0) is preserved, not deleted before it
+  plays. `stop()` sweeps any ephemeral downloads still in the set at shutdown. The user's own scanned
+  folder files (no id, created directly in `scan()`, not via `add_analyzed`) stay `ephemeral=False`
+  and are never touched. Everything stays re-fetchable via the manifest. Verified headless: ephemeral
+  flagging + manifest record, unplayed-preserve, played-delete, user-file-untouched, shutdown sweep.
 - **Transition styles (6)** — beyond the single equal-power+bass-swap blend. `dj/mixer.py`
   `TRANSITIONS = (smooth, bass_swap, filter, cut, echo, brake)`; `start_transition(dur, kind)` +
   a per-kind dispatch in `_advance_crossfade`. `smooth`=equal-power+bass swap; `bass_swap`=both
@@ -115,7 +161,15 @@ DONE already (were on this list): in-track EQ kills (per-deck low/mid/high kill 
 main.py            CLI entrypoint + live status line (--dashboard starts the web UI)
 dj/
   dashboard.py     stdlib HTTP + SSE state-broadcast & control layer over the live engine
-                   (GET / page, GET /events snapshots, GET /frame.jpg cam, POST /control)
+                   (GET / DJ page, GET /events snapshots, GET /frame.jpg cam, POST /control;
+                   GET /listen guest player, GET /ws-audio low-latency PCM WebSocket (hand-rolled
+                   RFC6455 handshake + _ws_frame), GET /stream.mp3 MP3 fallback; jukebox: GET
+                   /jukebox state, GET /jukebox/search, POST /jukebox/request → auto-queue)
+  netcast.py       NetCast: broadcasts the master mix to LAN listeners on two paths off one
+                   realtime-safe feed() (fed from mixer.mix()): WebSocket raw int16 PCM (low-
+                   latency, no encoder, lock-free fan-out + snap-to-live) and a persistent-ffmpeg
+                   PCM→MP3 icecast-style stream (compat fallback, encoder runs only while ≥1
+                   MP3 listener connected).
   audio_io.py      decode any format via ffmpeg subprocess → numpy (no libsndfile/librosa)
   analysis.py      BPM + beat-grid + energy, numpy/scipy only (spectral-flux onset →
                    autocorr w/ log-Gaussian tempo prior → comb-filter phase). Also section

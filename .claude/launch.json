@@ -6,6 +6,12 @@
       "runtimeExecutable": "./.venv/bin/python",
       "runtimeArgs": ["main.py", "demo_tracks", "--dry-run", "--simulate-crowd", "--dashboard", "--port", "8765"],
       "port": 8765
+    },
+    {
+      "name": "dj-youtube",
+      "runtimeExecutable": "./.venv/bin/python",
+      "runtimeArgs": ["main.py", "yt_cache", "--simulate-crowd", "--dashboard", "--lan", "--port", "8765"],
+      "port": 8765
     }
   ]
 }

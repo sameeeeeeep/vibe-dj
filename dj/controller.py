@@ -214,7 +214,7 @@ class Controller:
         nxt_e = incoming.energy if incoming else cur_e
         delta = nxt_e - cur_e
         if delta > 0.14:
-            bucket = ("cut", "echo")                     # lifting hard: punch it in
+            bucket = ("cut", "echo", "morph")            # lifting hard: punch/build it in
         elif delta < -0.14:
             bucket = ("filter", "brake")                 # cooling: wind it down
         else:

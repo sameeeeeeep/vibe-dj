@@ -7,6 +7,7 @@ venv/
 
 # DJ runtime artifacts
 yt_cache/
+fx_library/
 yt_test/
 yt_rock/
 yt_buf/
@@ -14,6 +15,8 @@ yt_main/
 demo_tracks/
 *.dj_cache.json
 .dj_cache.json
+# Personal library re-download recipe (titles/URLs); kept local, not published
+yt_library_manifest.json
 
 # Audio/scratch
 *.wav

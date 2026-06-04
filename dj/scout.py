@@ -69,6 +69,27 @@ class Scout:
     def stop(self) -> None:
         self._stop.set()
 
+    def dig_now(self, count: int = 3) -> Optional[str]:
+        """Fire a single on-demand dig for `count` vibe-matched tracks seeded by
+        the live song, off the background cadence — the dashboard's "fetch
+        similar" button. Runs on a worker thread so the caller returns at once.
+        Returns a short status to echo, or None if nothing's playing to seed
+        from. Works even when the background auto-dig loop was never started."""
+        live = self.controller.deck_tracks.get(self.controller.mixer.current)
+        if live is None:
+            self.log("[scout] nothing playing to seed a dig")
+            return None
+        n = max(1, int(count))
+
+        def work() -> None:
+            try:
+                self._dig(n)
+            except Exception as exc:  # noqa: BLE001 - surface, don't crash the server
+                self.log(f"[scout] dig failed: {exc}")
+
+        threading.Thread(target=work, daemon=True).start()
+        return f"digging {n} similar to {live.name[:40]}"
+
     def _loop(self) -> None:
         self._stop.wait(self.warmup)        # let the set get going first
         while not self._stop.is_set():
@@ -100,10 +121,11 @@ class Scout:
             pass
 
     # ---- the dig ---------------------------------------------------------
-    def _dig(self) -> None:
+    def _dig(self, count: Optional[int] = None) -> None:
         live = self.controller.deck_tracks.get(self.controller.mixer.current)
         if live is None:
             return
+        keep_cap = max(1, count if count is not None else self.batch)
         target = self.controller.current_target()
         live_bpm = self.controller.mixer.live_deck.effective_bpm
 
@@ -115,19 +137,19 @@ class Scout:
             how = f"mix of {live.name[:30]}"
         else:
             q = re.sub(r"\s*\[[^\]]*\]\s*", " ", live.name).strip() or live.name
-            url = f"ytsearch{self.batch * 2}:{q}"
+            url = f"ytsearch{keep_cap * 2}:{q}"
             how = f"search '{q[:30]}'"
-        self.log(f"[scout] digging — {how}  (target {target:.2f}, ~{live_bpm:.0f} BPM)")
+        self.log(f"[scout] digging {keep_cap} — {how}  (target {target:.2f}, ~{live_bpm:.0f} BPM)")
 
         try:
-            entries = yt.list_entries([url], limit=self.batch * 3, log=self.log)
+            entries = yt.list_entries([url], limit=max(self.batch, keep_cap) * 3, log=self.log)
         except Exception as exc:  # noqa: BLE001
             self.log(f"[scout] list failed: {exc}")
             return
 
         kept = 0
         for e in entries:
-            if self._stop.is_set() or kept >= self.batch:
+            if self._stop.is_set() or kept >= keep_cap:
                 break
             eid = e.get("id")
             if not eid or eid == seed_id or eid in have_ids:

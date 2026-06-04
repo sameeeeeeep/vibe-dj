@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import threading
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -18,6 +19,10 @@ from .audio_io import decode
 AUDIO_EXTS = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".oga",
               ".opus", ".webm", ".mp4", ".aiff", ".aif"}
 CACHE_NAME = ".dj_cache.json"
+# yt-dlp names cached files "<title> [<11-char-id>].<ext>"; pull the id back out
+# so a runtime download can be recorded in the manifest and re-fetched later.
+MANIFEST_NAME = "yt_library_manifest.json"
+_VID_RE = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
 
 
 def score_energy(tracks: list["Track"]) -> None:
@@ -53,6 +58,9 @@ class Track:
     energy: float = 0.5         # 0..1, normalised across the library
     play_count: int = 0
     last_played_at: float = 0.0  # monotonic seconds; 0 = never
+    # Runtime YouTube download (jukebox/auto-dig) recorded in the manifest, so it
+    # can be deleted after play and re-fetched later. User's own files stay False.
+    ephemeral: bool = False
 
     @property
     def bpm(self) -> float:
@@ -93,6 +101,10 @@ class Library:
         # Guards concurrent runtime additions (add_url) against the controller /
         # dashboard threads reading self.tracks. Not a dataclass field.
         self._add_lock = threading.Lock()
+        # Manifest lives beside the cache folder (repo root for yt_cache), matching
+        # tools/redownload_library.py, so a trimmed cache can be restored later.
+        self._manifest_path = os.path.join(
+            os.path.dirname(os.path.abspath(self.folder)) or ".", MANIFEST_NAME)
 
     def scan(self, progress: Optional[Callable[[int, int, str], None]] = None) -> "Library":
         files = list(_iter_audio_files(self.folder))
@@ -137,19 +149,44 @@ class Library:
         return decode(track.path, sr=SAMPLE_RATE)
 
     def release(self, track: Track) -> None:
-        """No-op for a static folder — we never delete the user's own files."""
-        return
+        """Free a *runtime-downloaded* track once it has actually played: drop it
+        from the live set and delete the on-disk file (it's recorded in the
+        manifest, so it can be re-fetched). The user's own folder files (not
+        ephemeral) are never touched, keeping the static-folder contract.
+
+        The ``play_count >= 1`` gate matters: the controller also calls release()
+        when *unstaging* a cued-but-never-played track (it decrements play_count to
+        0 first), and we must keep those — a guest's queued request bumped off the
+        cue shouldn't be deleted before it ever plays."""
+        if not getattr(track, "ephemeral", False) or track.play_count < 1:
+            return
+        with self._add_lock:
+            self.tracks = [t for t in self.tracks if t is not track]
+            self._score_energy()
+        try:
+            os.remove(track.path)
+        except OSError:
+            pass
 
     def add_analyzed(self, track: Track) -> Optional[Track]:
         """Splice an already-analysed Track into the live set. Thread-safe: the
         list is rebuilt and atomically rebound so the controller/dashboard never
         see a torn list, and energies are re-ranked across the set. Returns the
-        Track, or None if one with the same path is already present."""
+        Track, or None if one with the same path is already present.
+
+        Any track whose filename carries a YouTube id (every runtime download —
+        jukebox or auto-dig) is marked ephemeral and recorded in the manifest, so
+        release() can delete the file after play and it stays re-fetchable."""
+        vid_match = _VID_RE.search(os.path.basename(track.path))
         with self._add_lock:
             if any(t.path == track.path for t in self.tracks):
                 return None
+            if vid_match:
+                track.ephemeral = True
             self.tracks = list(self.tracks) + [track]
             self._score_energy()
+            if vid_match:
+                self._manifest_add(vid_match.group(1), track.name, track.path)
         return track
 
     def add_track_file(self, path: str,
@@ -191,3 +228,46 @@ class Library:
             if t is not None:
                 added.append(t)
         return added
+
+    def _manifest_add(self, vid: str, title: str, path: str) -> None:
+        """Record a runtime download in the manifest so a trimmed cache can be
+        restored by tools/redownload_library.py. Merge-by-id (idempotent) and
+        preserve the file's existing note/cache_dir header. Call holding _add_lock.
+        Best-effort: a manifest write failure must not break ingest."""
+        try:
+            try:
+                with open(self._manifest_path) as fh:
+                    data = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                data = {}
+            tracks = data.get("tracks")
+            if not isinstance(tracks, list):
+                tracks = []
+            if not any(isinstance(e, dict) and e.get("id") == vid for e in tracks):
+                tracks.append({
+                    "id": vid,
+                    "title": title,
+                    "filename": os.path.basename(path),
+                    "url": f"https://www.youtube.com/watch?v={vid}",
+                })
+            data["tracks"] = tracks
+            data["count"] = len(tracks)
+            data.setdefault("cache_dir", os.path.basename(os.path.abspath(self.folder)))
+            data.setdefault("note", "Run tools/redownload_library.py to restore audio "
+                                    "into cache_dir from these URLs.")
+            with open(self._manifest_path, "w") as fh:
+                json.dump(data, fh, indent=2)
+        except OSError:
+            pass
+
+    def stop(self) -> None:
+        """Shutdown sweep: delete any ephemeral downloads that never played, so a
+        run that fetched guest/auto-dig tracks doesn't leave them on the tight
+        disk. They remain in the manifest, so they're re-fetchable."""
+        with self._add_lock:
+            leftover = [t for t in self.tracks if getattr(t, "ephemeral", False)]
+        for t in leftover:
+            try:
+                os.remove(t.path)
+            except OSError:
+                pass

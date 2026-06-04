@@ -38,13 +38,15 @@ BEATS_PER_BAR = 4   # 4/4 — used to size audition pre/post-roll in bars
 #   cut       — hard downbeat cut (a few ms, just click-free)
 #   echo      — throw the outgoing into a beat-echo and pull it down under the tail
 #   brake     — tape-stop the outgoing to a halt, then slam the incoming in
-TRANSITIONS = ("smooth", "bass_swap", "filter", "cut", "echo", "brake")
+#   morph     — stutter-loop the outgoing's last beat with a shrinking window +
+#               rising pitch (the "ee-ee-eeeh-EHH" build), then SLAM the incoming
+TRANSITIONS = ("smooth", "bass_swap", "filter", "cut", "echo", "brake", "morph")
 
 # Per-style length (seconds). None = use the caller's crossfade length (the long
 # musical blends); the punchy styles pin their own short length regardless.
 _KIND_SECONDS = {
     "smooth": None, "bass_swap": None, "filter": None,
-    "cut": 0.035, "echo": 6.0, "brake": 3.0,
+    "cut": 0.035, "echo": 6.0, "brake": 3.0, "morph": 3.2,
 }
 
 
@@ -72,6 +74,52 @@ class _FeedbackDelay:
         self._buf[(w + np.arange(n)) % L] = x + feedback * wet
         self._w = (w + n) % L
         return wet
+
+
+class _MorphRiser:
+    """The 'morph' transition's riser voice — the "ee-ee-eeeh-EHH" build.
+
+    Captures one beat of the OUTGOING track and stutter-loops it with a window
+    that shrinks in musical steps (1 -> 1/2 -> 1/4 -> 1/8 beat) while the pitch
+    sweeps up (resampling faster). Shorter window = faster retrigger, so the
+    stutter accelerates into the slam. Vectorised per block — the loop wraps with
+    a modulo, no per-sample Python loop runs in the audio callback."""
+
+    def __init__(self):
+        self._slice = np.zeros((0, CHANNELS), dtype=np.float32)
+        self._beat = 1       # one captured beat, in frames (the base window)
+        self._pos = 0.0      # fractional read position, wrapped into the window
+
+    def load(self, slice_samples: np.ndarray, beat_frames: int) -> None:
+        self._slice = np.ascontiguousarray(slice_samples, dtype=np.float32)
+        self._beat = max(2, int(beat_frames))
+        self._pos = 0.0
+
+    def process(self, n: int, p: float) -> np.ndarray:
+        out = np.zeros((n, CHANNELS), dtype=np.float32)
+        L = len(self._slice)
+        if L < 2:
+            return out
+        # Window shrinks in discrete musical steps as the build rises.
+        if p < 0.30:
+            frac = 1.0
+        elif p < 0.55:
+            frac = 0.5
+        elif p < 0.78:
+            frac = 0.25
+        else:
+            frac = 0.125
+        win = max(2, min(L, int(self._beat * frac)))
+        rate = 1.0 + 1.0 * min(1.0, p)        # pitch sweeps up ~1.0 -> 2.0
+        start = self._pos % win               # re-anchor when the window changes
+        positions = (start + np.arange(n) * rate) % win
+        idx0 = np.floor(positions).astype(np.int64)
+        frac_part = (positions - idx0).astype(np.float32)[:, None]
+        i0 = idx0 % win
+        i1 = (idx0 + 1) % win
+        out[:] = self._slice[i0] * (1.0 - frac_part) + self._slice[i1] * frac_part
+        self._pos = start + n * rate
+        return out
 
 
 class Mixer:
@@ -129,6 +177,7 @@ class Mixer:
         self._echo = _FeedbackDelay(3.0)   # delay line for the 'echo' throw
         self._echo_delay = 1         # one-beat delay (frames) for this throw
         self._brake_rate = 1.0       # outgoing deck's rate captured for a brake
+        self._morph = _MorphRiser()  # riser voice for the 'morph' build
 
         self._stream = None
         self._thread = None
@@ -149,6 +198,9 @@ class Mixer:
         self._cue_pos = 0.0            # preview playhead for pre-listening one deck
         self._cue_mon_deck = ""        # which deck that playhead is currently tracking
         self._last_master = None       # cached master block for the "master" monitor
+        # Optional LAN broadcaster (dj/netcast.py). When set, every mixed block is
+        # fed to it for MP3 streaming to other machines. None = not broadcasting.
+        self.netcast = None
         # One-shot audition: render the real blend (outgoing@mix_out -> incoming
         # @mix_in over the crossfade) to the monitor only, on preview playheads.
         self._aud_active = False
@@ -235,10 +287,11 @@ class Mixer:
             x = (src_period - (from_next * nxt.rate) % src_period) % src_period
             nxt.pos = max(0.0, (nxt.eff_mix_in() + x) * SAMPLE_RATE)
         nxt.gain = 0.0
-        # A brake stops the room dead, then drops the new track in — so hold the
-        # incoming frozen at its cue (read() won't advance a non-playing deck)
-        # until the brake completes, where _advance_crossfade starts it cleanly.
-        nxt.playing = (kind != "brake")
+        # A brake stops the room dead and a morph rides a riser up; both drop the
+        # new track in only at the end — so hold the incoming frozen at its cue
+        # (read() won't advance a non-playing deck) until the style releases it in
+        # _advance_crossfade, where it starts cleanly.
+        nxt.playing = kind not in ("brake", "morph")
 
         # Fresh auto-EQ on both decks so the previous style leaves nothing behind.
         self.eq_auto[self.current] = [1.0, 1.0, 1.0]
@@ -251,6 +304,11 @@ class Mixer:
             self._echo_delay = max(1, int(bp * SAMPLE_RATE))
         elif kind == "brake":
             self._brake_rate = max(0.1, live.rate)
+        elif kind == "morph":
+            # Grab the outgoing track's last beat (source frames) for the riser to
+            # stutter-loop. One source beat == beat_period seconds of samples.
+            beat_frames = max(2, int(live.analysis.beat_period * SAMPLE_RATE))
+            self._morph.load(live.tail_slice(beat_frames), beat_frames)
 
         with self._xf_lock:
             self._xf_from = self.current
@@ -315,6 +373,16 @@ class Mixer:
                 if p >= 0.62 and not to.playing:
                     to.playing = True            # release the frozen incoming
                 tp = min(1.0, max(0.0, (p - 0.62) / 0.30))
+                to.gain = float(np.sin(tp * np.pi / 2))
+
+            elif kind == "morph":
+                # The riser (built in mix() from the captured beat) IS the
+                # outgoing voice, so mute the deck's own read. Near the top of the
+                # build the incoming is released from its frozen cue and slams in.
+                frm.gain = 0.0
+                if p >= 0.86 and not to.playing:
+                    to.playing = True
+                tp = min(1.0, max(0.0, (p - 0.86) / 0.14))
                 to.gain = float(np.sin(tp * np.pi / 2))
 
             else:   # "smooth" and "bass_swap"
@@ -442,6 +510,41 @@ class Mixer:
             return out
         except Exception:  # noqa: BLE001
             return []
+
+    def rescan_devices(self) -> list[dict]:
+        """Force PortAudio to re-enumerate devices, then return the fresh
+        output list. macOS only exposes a device (e.g. AirPods) to CoreAudio
+        once it's actively routed, and PortAudio snapshots the device list at
+        init — so anything connected after launch never appears in
+        list_output_devices() until PortAudio is re-initialized. We drop the
+        open streams (so there are no handles when we terminate), reinit, then
+        reopen on the same devices. The master output blips briefly."""
+        import sounddevice as sd
+        had_cue = self.cue_device is not None and self.cue_enabled
+        self._close_cue_stream()
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._stream = None
+        try:
+            sd._terminate()
+        except Exception:  # noqa: BLE001 - not initialized yet (dry-run); ignore
+            pass
+        try:
+            sd._initialize()
+        except Exception:  # noqa: BLE001
+            pass
+        if not self.dry_run:
+            try:
+                self._open_master_stream()
+            except Exception as exc:  # noqa: BLE001
+                self._cue_error = f"master reopen failed: {exc}"
+            if had_cue:
+                self._open_cue_stream()
+        return self.list_output_devices()
 
     def _resolve_device(self, device):
         """Map an index or a name-substring to a PortAudio device index."""
@@ -644,6 +747,8 @@ class Mixer:
             # Frozen: no deck advance, silent output. Resumes exactly in place.
             silent = np.zeros((n, CHANNELS), dtype=np.float32)
             self._last_master = silent
+            if self.netcast is not None:
+                self.netcast.feed(silent)  # keep listeners connected through a pause
             return silent
         self._advance_crossfade(n)
         out = np.zeros((n, CHANNELS), dtype=np.float32)
@@ -651,6 +756,8 @@ class Mixer:
             echoing = self._xf_active and self._xf_type == "echo"
             efrom = self._xf_from
             edelay = self._echo_delay
+            morphing = self._xf_active and self._xf_type == "morph"
+            mp = min(1.0, self._xf_done / self._xf_total) if morphing else 0.0
         echo_src = None
         for name, d in self.decks.items():
             g = d.gain
@@ -670,6 +777,17 @@ class Mixer:
                 out += self._echo.process(src, edelay, 0.55) * 0.9
             except Exception:  # noqa: BLE001 - never break the audio callback
                 pass
+        # Morph riser: stutter-looped beat carries the outgoing voice through the
+        # build, rides up, then ducks out as the incoming slams in past p~0.86.
+        if morphing:
+            try:
+                if mp < 0.86:
+                    mlevel = 0.85 + 0.15 * (mp / 0.86)
+                else:
+                    mlevel = max(0.0, 1.0 - (mp - 0.86) / 0.14)
+                out += self._morph.process(n, mp) * mlevel
+            except Exception:  # noqa: BLE001 - never break the audio callback
+                pass
         # Drum layer rides on top of the deck blend, locked to the live deck.
         out += self.beats.render(n, self.live_deck)
         # MIDI melody layer, beat-locked to the live deck like the drums.
@@ -680,6 +798,8 @@ class Mixer:
         # Cache for the "master" monitor source (the cue stream reads this, one
         # block stale at worst — fine for monitoring).
         self._last_master = out
+        if self.netcast is not None:
+            self.netcast.feed(out)     # broadcast to LAN listeners, if any
         return out
 
     # ---- backends --------------------------------------------------------
@@ -688,6 +808,13 @@ class Mixer:
             self._thread = threading.Thread(target=self._dummy_loop, daemon=True)
             self._thread.start()
             return
+        self._open_master_stream()
+        # Bring up the monitor feed too if a cue device was chosen at launch
+        # (it can also be selected later from the dashboard).
+        if self.cue_device is not None:
+            self._open_cue_stream()
+
+    def _open_master_stream(self) -> None:
         import sounddevice as sd
 
         def callback(outdata, frames, time_info, status):
@@ -700,10 +827,6 @@ class Mixer:
             device=self._resolve_device(self.master_device),  # None = default
         )
         self._stream.start()
-        # Bring up the monitor feed too if a cue device was chosen at launch
-        # (it can also be selected later from the dashboard).
-        if self.cue_device is not None:
-            self._open_cue_stream()
 
     def _dummy_loop(self) -> None:
         period = BLOCK / SAMPLE_RATE

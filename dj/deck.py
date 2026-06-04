@@ -14,6 +14,26 @@ import numpy as np
 from . import CHANNELS, SAMPLE_RATE
 from .analysis import Analysis
 
+WAVE_BINS = 64
+
+
+def _wave_envelope(samples: np.ndarray, bins: int = WAVE_BINS) -> list[float]:
+    """Peak envelope of a track, downsampled to `bins` values in 0..1, for the
+    dashboard waveform. Peak (not RMS) so drops and transients read clearly; a
+    small floor keeps quiet bins visible. Computed once per load, never in the
+    audio callback."""
+    n = len(samples)
+    if n < bins:
+        return [0.0] * bins
+    mono = np.abs(samples).max(axis=1) if samples.ndim > 1 else np.abs(samples)
+    edges = np.linspace(0, n, bins + 1).astype(np.int64)
+    env = np.maximum.reduceat(mono, edges[:-1]).astype(np.float32)
+    peak = float(env.max())
+    if peak > 0:
+        env = env / peak
+    env = 0.06 + 0.94 * env
+    return [round(float(x), 3) for x in env]
+
 
 class Deck:
     def __init__(self, name: str):
@@ -22,6 +42,7 @@ class Deck:
         self.samples = np.zeros((0, CHANNELS), dtype=np.float32)
         self.analysis: Analysis | None = None
         self.title = ""
+        self.wave: list[float] = [0.0] * WAVE_BINS  # peak envelope for the UI
         self.pos = 0.0          # fractional frame index into samples
         self.rate = 1.0         # beatmatch playback speed (1.0 == original tempo)
         self.bend = 0.0         # manual pitch-fader offset (fraction, ±), DJ-driven
@@ -37,8 +58,11 @@ class Deck:
         self.mix_out_override: float | None = None
 
     def load(self, samples: np.ndarray, analysis: Analysis, title: str) -> None:
+        samples = np.ascontiguousarray(samples, dtype=np.float32)
+        wave = _wave_envelope(samples)   # outside the lock; never stall the callback
         with self._lock:
-            self.samples = np.ascontiguousarray(samples, dtype=np.float32)
+            self.samples = samples
+            self.wave = wave
             self.analysis = analysis
             self.title = title
             self.pos = 0.0
@@ -134,6 +158,19 @@ class Deck:
             if self.pos >= length - 1:
                 self.playing = False
             return out
+
+    def tail_slice(self, n_samples: int) -> np.ndarray:
+        """A contiguous copy of up to `n_samples` frames ending at the current
+        playhead. Used by the morph transition to capture the outgoing track's
+        last beat for its stutter-loop riser. Returns a copy (not a view) so the
+        caller can hold it without racing the deck; empty if nothing is loaded."""
+        with self._lock:
+            length = len(self.samples)
+            if length == 0 or n_samples <= 0:
+                return np.zeros((0, CHANNELS), dtype=np.float32)
+            end = int(min(length, max(1, self.pos)))
+            start = max(0, end - int(n_samples))
+            return np.array(self.samples[start:end], dtype=np.float32)
 
     def read_preview(self, pos: float, n: int, rate: float) -> tuple[np.ndarray, float]:
         """Read `n` frames starting at fractional index `pos` at the given rate,
