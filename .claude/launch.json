@@ -12,6 +12,12 @@
       "runtimeExecutable": "./.venv/bin/python",
       "runtimeArgs": ["main.py", "yt_cache", "--simulate-crowd", "--dashboard", "--lan", "--port", "8765"],
       "port": 8765
+    },
+    {
+      "name": "dj-cache",
+      "runtimeExecutable": "./.venv/bin/python",
+      "runtimeArgs": ["main.py", "yt_cache", "--simulate-crowd", "--dashboard", "--port", "8765"],
+      "port": 8765
     }
   ]
 }

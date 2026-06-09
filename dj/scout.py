@@ -69,26 +69,29 @@ class Scout:
     def stop(self) -> None:
         self._stop.set()
 
-    def dig_now(self, count: int = 3) -> Optional[str]:
-        """Fire a single on-demand dig for `count` vibe-matched tracks seeded by
-        the live song, off the background cadence — the dashboard's "fetch
-        similar" button. Runs on a worker thread so the caller returns at once.
-        Returns a short status to echo, or None if nothing's playing to seed
-        from. Works even when the background auto-dig loop was never started."""
-        live = self.controller.deck_tracks.get(self.controller.mixer.current)
-        if live is None:
-            self.log("[scout] nothing playing to seed a dig")
+    def dig_now(self, count: int = 3, seed: Optional["Track"] = None) -> Optional[str]:
+        """Fire a single on-demand dig for `count` vibe-matched tracks — the
+        dashboard's "dig similar" buttons. With no `seed` it digs off the live
+        song (the header DIG 3 button); pass a `seed` track to pull "more like
+        this one" off any specific queued/crate track. Runs on a worker thread so
+        the caller returns at once. Returns a short status to echo, or None if
+        there's nothing to seed from. Works even when the background auto-dig loop
+        was never started."""
+        if seed is None:
+            seed = self.controller.deck_tracks.get(self.controller.mixer.current)
+        if seed is None:
+            self.log("[scout] nothing to seed a dig from")
             return None
         n = max(1, int(count))
 
         def work() -> None:
             try:
-                self._dig(n)
+                self._dig(n, seed=seed)
             except Exception as exc:  # noqa: BLE001 - surface, don't crash the server
                 self.log(f"[scout] dig failed: {exc}")
 
         threading.Thread(target=work, daemon=True).start()
-        return f"digging {n} similar to {live.name[:40]}"
+        return f"digging {n} similar to {seed.name[:40]}"
 
     def _loop(self) -> None:
         self._stop.wait(self.warmup)        # let the set get going first
@@ -121,25 +124,30 @@ class Scout:
             pass
 
     # ---- the dig ---------------------------------------------------------
-    def _dig(self, count: Optional[int] = None) -> None:
+    def _dig(self, count: Optional[int] = None, seed: Optional["Track"] = None) -> None:
         live = self.controller.deck_tracks.get(self.controller.mixer.current)
-        if live is None:
+        if seed is None:
+            seed = live
+        if seed is None:
             return
         keep_cap = max(1, count if count is not None else self.batch)
         target = self.controller.current_target()
-        live_bpm = self.controller.mixer.live_deck.effective_bpm
+        # Gate new tracks to the seed's tempo so they blend. Off the live deck we
+        # use its *heard* (varispeed) BPM; for an explicit pick, that track's BPM.
+        gate_bpm = (self.controller.mixer.live_deck.effective_bpm
+                    if seed is live else seed.analysis.bpm)
 
         have_ids = {self._vid(t.path) for t in self.library.tracks}
         have_ids.discard(None)
-        seed_id = self._vid(live.path)
+        seed_id = self._vid(seed.path)
         if seed_id:
             url = f"https://www.youtube.com/watch?v={seed_id}&list=RD{seed_id}"
-            how = f"mix of {live.name[:30]}"
+            how = f"mix of {seed.name[:30]}"
         else:
-            q = re.sub(r"\s*\[[^\]]*\]\s*", " ", live.name).strip() or live.name
+            q = re.sub(r"\s*\[[^\]]*\]\s*", " ", seed.name).strip() or seed.name
             url = f"ytsearch{keep_cap * 2}:{q}"
             how = f"search '{q[:30]}'"
-        self.log(f"[scout] digging {keep_cap} — {how}  (target {target:.2f}, ~{live_bpm:.0f} BPM)")
+        self.log(f"[scout] digging {keep_cap} — {how}  (target {target:.2f}, ~{gate_bpm:.0f} BPM)")
 
         try:
             entries = yt.list_entries([url], limit=max(self.batch, keep_cap) * 3, log=self.log)
@@ -163,8 +171,8 @@ class Scout:
                 self.log(f"[scout] analyse failed: {exc}")
                 self._discard(path)
                 continue
-            # Tempo gate: keep only what blends cleanly with the live track.
-            if live_bpm > 0 and abs(an.bpm - live_bpm) / live_bpm > self.bpm_window:
+            # Tempo gate: keep only what blends cleanly with the seed's tempo.
+            if gate_bpm > 0 and abs(an.bpm - gate_bpm) / gate_bpm > self.bpm_window:
                 self.log(f"[scout] skip {an.bpm:.0f} BPM off-tempo  "
                          f"{os.path.basename(path)[:28]}")
                 self._discard(path)

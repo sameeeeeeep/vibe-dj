@@ -45,6 +45,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+from . import qrcode
 from .netcast import NetCast
 
 # Most jukebox (LAN-guest) YouTube downloads allowed in flight at once. Crate
@@ -296,7 +297,8 @@ class Dashboard:
             "log": [{"t": t, "m": m} for (t, m) in self.controller.recent_events(14)],
             "broadcast": {
                 "listeners": self.netcast.listeners() + self.netcast.ws_listeners(),
-                "url": f"http://{self._lan_ip}:{self.port}/listen",
+                "url": self.listen_url(),
+                "lan": self.host == "0.0.0.0",
             },
         }
         # The full downloaded crate can be 100s of tracks (~30 KB JSON). Sending
@@ -350,7 +352,7 @@ class Dashboard:
             else:
                 self.controller.log("[add]   ignored (need an http(s) link)")
         elif cmd == "dig_similar":
-            self._dig_similar(int(value) if value >= 1 else 3)
+            self._dig_similar(int(value) if value >= 1 else 3, self._tid(payload))
         elif cmd == "queue_add":
             self.controller.queue_add(self._tid(payload))
         elif cmd == "queue_remove":
@@ -458,16 +460,31 @@ class Dashboard:
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _dig_similar(self, count: int = 3) -> None:
-        """Auto-fetch `count` vibe-matched tracks seeded by the live song: the
-        scout pulls YouTube's Mix off the current track, keeps the on-tempo ones,
-        and splices them into the crate so the autopilot can pick them next. The
-        scout already worker-threads the slow network/analysis, so this returns
-        at once; progress shows in the decision log."""
+    def _dig_similar(self, count: int = 3, tid: int = 0) -> None:
+        """Auto-fetch `count` vibe-matched tracks: the scout pulls YouTube's Mix
+        off a seed track, keeps the on-tempo ones, and splices them into the crate
+        so the autopilot can pick them next. With no `tid` the seed is the live
+        song (the header DIG 3 button); with a `tid` it's that specific queued or
+        crate track, so the DJ can pull 'more like this one' from anywhere. The
+        scout worker-threads the slow network/analysis, so this returns at once;
+        progress shows in the decision log."""
         if self.scout is None:
             self.controller.log("[dig]   unavailable (this source can't take new tracks)")
             return
-        self.scout.dig_now(count)
+        seed = self.controller._resolve_tid(tid) if tid else None
+        self.scout.dig_now(count, seed=seed)
+
+    def listen_url(self) -> str:
+        """The address a guest types on another device to hear the set — the LAN
+        IP so it's reachable off-box (only actually reachable when launched with
+        --lan, which binds 0.0.0.0)."""
+        return f"http://{self._lan_ip}:{self.port}/listen"
+
+    def listen_qr_svg(self) -> str:
+        """A scannable QR of the listen URL (guests point a phone camera at it).
+        Generated with the dependency-free numpy encoder; the URL is fixed for
+        the run, so it's cacheable."""
+        return qrcode.svg(self.listen_url(), quiet=4, module=8)
 
     # ---- jukebox (LAN-guest requests) ------------------------------------
     def jukebox_state(self) -> dict:
@@ -586,6 +603,10 @@ class Dashboard:
                                    {"Cache-Control": "no-store"})
                 elif path == "/listen":
                     self._send(200, LISTEN_PAGE.encode(), "text/html; charset=utf-8")
+                elif path == "/listen.qr.svg":
+                    self._send(200, dashboard.listen_qr_svg().encode(),
+                               "image/svg+xml; charset=utf-8",
+                               {"Cache-Control": "max-age=60"})
                 elif path == "/ws-audio":
                     self._serve_ws_audio()
                 elif path == "/stream.mp3":
@@ -774,6 +795,22 @@ PAGE = r"""<!doctype html>
     text-decoration:none;transition:color .2s,border-color .2s;}
   .bcast-pill:hover{color:var(--td);border-color:var(--td);}
   .bcast-pill.on{border-color:var(--deck-a);color:var(--deck-a);}
+  .bcast-wrap{position:relative;}
+  .qr-pop{position:absolute;top:calc(100% + 8px);right:0;z-index:60;width:208px;
+    background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:14px;
+    box-shadow:0 16px 40px rgba(0,0,0,.55);display:flex;flex-direction:column;align-items:center;gap:9px;}
+  .qr-pop[hidden]{display:none;}
+  .qr-pop-h{font-family:var(--f-mono);font-size:9px;letter-spacing:.2em;color:var(--tf);}
+  .qr-img{width:160px;height:160px;border-radius:8px;background:#fff;padding:6px;box-sizing:border-box;}
+  .qr-url{font-family:var(--f-mono);font-size:11px;color:var(--deck-a);word-break:break-all;text-align:center;line-height:1.4;}
+  .qr-row{display:flex;gap:6px;width:100%;}
+  .qr-btn{flex:1;text-align:center;font-family:var(--f-disp);font-weight:600;font-size:10px;letter-spacing:.06em;
+    padding:7px 0;border-radius:7px;border:1px solid var(--border);background:var(--bg-inset);color:var(--td);
+    text-decoration:none;cursor:pointer;transition:border-color .15s,color .15s;}
+  .qr-btn:hover{color:var(--tp);border-color:var(--td);}
+  .qr-btn.done{color:var(--ok);border-color:#1C3A2B;}
+  .qr-hint{font-family:var(--f-mono);font-size:9px;letter-spacing:.04em;color:var(--tf);text-align:center;line-height:1.5;}
+  .qr-hint.warn{color:var(--warn);}
   .dot{width:6px;height:6px;border-radius:50%;background:currentColor;display:inline-block;flex:none;}
   .dot-ok{background:var(--ok);} .dot-live{background:var(--danger);} .dot-faint{background:var(--tf);}
 
@@ -992,6 +1029,9 @@ PAGE = r"""<!doctype html>
   .iconbtn.ondeck{color:var(--deck-a);border-color:var(--deck-a-dim);background:#0C2630;cursor:default;
     font-family:var(--f-disp);font-weight:600;font-size:10px;letter-spacing:.05em;}
   .iconbtn.ondeck:active{transform:none;}
+  .iconbtn.dig{color:var(--deck-b);border-color:var(--deck-b-dim);min-width:28px;padding:0 7px;}
+  .iconbtn.dig:hover{color:var(--deck-b);border-color:var(--deck-b);}
+  .iconbtn.dig:disabled{opacity:.5;cursor:default;color:var(--tf);border-color:var(--border);}
   .queue-empty,.crate-empty{color:var(--tf);font-family:var(--f-mono);font-size:11px;line-height:1.7;
     padding:14px 10px;text-align:center;}
 
@@ -1365,9 +1405,21 @@ PAGE = r"""<!doctype html>
       <div class="tstat"><span class="tstat-l">IN ROTATION</span><span class="tstat-v" id="rotation">0 TRACKS</span></div>
       <button class="transport" id="playpause" onclick="send('pause')">
         <span class="pp-ic" id="pp-ic">&#9208;</span><span id="pp-txt">PAUSE</span></button>
-      <a class="bcast-pill" id="bcast-pill" href="/listen" target="_blank" title="Open the listen page on this or any Mac/phone on the Wi-Fi">
-        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><path d="M4.9 4.9a10 10 0 0 0 0 14.2M19.1 4.9a10 10 0 0 1 0 14.2M7.8 7.8a6 6 0 0 0 0 8.5M16.2 7.8a6 6 0 0 1 0 8.5"/><circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"/></svg>
-        <span id="bcast-txt">LAN OFF</span></a>
+      <div class="bcast-wrap">
+        <button class="bcast-pill" id="bcast-pill" type="button" onclick="toggleQr()" title="Show the listen link & QR for guests on the Wi-Fi">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><path d="M4.9 4.9a10 10 0 0 0 0 14.2M19.1 4.9a10 10 0 0 1 0 14.2M7.8 7.8a6 6 0 0 0 0 8.5M16.2 7.8a6 6 0 0 1 0 8.5"/><circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"/></svg>
+          <span id="bcast-txt">LAN OFF</span></button>
+        <div class="qr-pop" id="qr-pop" hidden>
+          <div class="qr-pop-h">&#128241; SCAN TO LISTEN</div>
+          <img class="qr-img" id="qr-img" alt="listen QR code">
+          <div class="qr-url" id="qr-url">&hellip;</div>
+          <div class="qr-row">
+            <button class="qr-btn" id="qr-copy" type="button" onclick="copyListen()">COPY LINK</button>
+            <a class="qr-btn" id="qr-open" href="/listen" target="_blank">OPEN &#8599;</a>
+          </div>
+          <div class="qr-hint" id="qr-hint">on the same Wi-Fi &middot; tap GO LIVE on the phone</div>
+        </div>
+      </div>
       <div class="live-pill" id="live-pill"><span class="dot" id="live-dot"></span><span id="live-txt">CONNECTING</span></div>
     </div>
   </div>
@@ -1728,6 +1780,7 @@ PAGE = r"""<!doctype html>
 
 <script>
 const $ = id => document.getElementById(id);
+let BCAST = {url:"", lan:false}, qrLoaded=false;
 function fmt(s){ if(s==null||isNaN(s)) return "0:00"; s=Math.max(0,s|0);
   return Math.floor(s/60)+":"+String(s%60).padStart(2,"0"); }
 function esc(x){ return String(x).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -1932,10 +1985,11 @@ function render(s){
   $("mode-tag").textContent = crowdManual ? "MANUAL · DJ-STEERED" : "AUTOPILOT · CROWD-STEERED";
   const bc=s.broadcast;
   if(bc){
-    const bp=$("bcast-pill"), n=bc.listeners||0;
-    bp.href = bc.url;
-    bp.classList.toggle("on", n>0);
+    const n=bc.listeners||0;
+    BCAST.url = bc.url; BCAST.lan = !!bc.lan;
+    $("bcast-pill").classList.toggle("on", n>0);
     $("bcast-txt").textContent = n>0 ? ("ON AIR · "+n+(n===1?" EAR":" EARS")) : "LISTEN ↗";
+    if(!$("qr-pop").hidden) syncQr();   // keep the open popover's text live
   }
   // While the DJ is dragging the fader, don't let the SSE frame fight the grab.
   if(!draggingVibe){
@@ -1980,6 +2034,7 @@ function render(s){
       +'<span class="qmeta">'+t.bpm.toFixed(0)+'<small>BPM</small>'
         +'<span class="cdot2" style="background:'+ec+'"></span></span>'
       +'<span class="qbtns">'
+        +'<button class="iconbtn dig" title="dig 3 tracks like this one" onclick="digFrom(\''+t.tid+'\',this)">&#9733;</button>'
         +'<button class="iconbtn" title="move up" onclick="qmove(\''+t.tid+'\',-1)">&#9650;</button>'
         +'<button class="iconbtn" title="move down" onclick="qmove(\''+t.tid+'\',1)">&#9660;</button>'
         +'<button class="iconbtn" title="remove" onclick="qremove(\''+t.tid+'\')">&#10005;</button>'
@@ -1999,6 +2054,7 @@ function render(s){
       if(t.loaded) action='<button class="iconbtn ondeck" disabled>ON DECK</button>';
       else if(t.queued) action='<button class="iconbtn add queued" title="remove from queue" onclick="qremove(\''+t.tid+'\')">&#10003; QUEUED</button>';
       else action='<button class="iconbtn add" title="add to queue" onclick="qadd(\''+t.tid+'\')">&#65291; QUEUE</button>';
+      const digb='<button class="iconbtn dig" title="dig 3 tracks like this one" onclick="digFrom(\''+t.tid+'\',this)">&#9733;</button>';
       const pc = t.play_count>0 ? '<span class="pc-tag">'+t.play_count+'&times;</span>' : '';
       return '<div class="crow'+(t.loaded?' on':'')+'">'
         +'<span class="cnum2">'+String(i+1).padStart(2,"0")+'</span>'
@@ -2006,7 +2062,7 @@ function render(s){
         +'<span class="cmeta">'+pc+t.bpm.toFixed(0)+'<small>BPM</small>'
           +'<span class="cdot2" style="background:'+ec+'"></span>'
           +'<span style="color:'+ec+'">'+t.energy.toFixed(2)+'</span></span>'
-        +action+'</div>';
+        +digb+action+'</div>';
     }).join("") || '<div class="crate-empty">no tracks downloaded yet&hellip;</div>';
   }
 
@@ -2250,6 +2306,44 @@ function digSimilar(btn){
   if(btn){ const o=btn.innerHTML; btn.innerHTML="DIGGING…"; btn.disabled=true;
     setTimeout(()=>{ btn.innerHTML=o; btn.disabled=false; }, 6000); }
 }
+
+// Per-row "dig 3 like this": same fetch, but seeded off the specific track the
+// DJ clicked (queue or crate row) instead of what's playing now.
+function digFrom(tid, btn){
+  post({cmd:"dig_similar", value:3, tid:tid});
+  if(btn){ const o=btn.innerHTML; btn.innerHTML="…"; btn.disabled=true;
+    setTimeout(()=>{ btn.innerHTML=o; btn.disabled=false; }, 6000); }
+}
+
+// ---- listen link + QR popover ------------------------------------------
+// The LISTEN pill opens a popover with a scannable QR (guests point a phone at
+// it) plus the URL to type. The QR is served at /listen.qr.svg (fixed for the
+// run, so it's loaded once). syncQr keeps the URL/hint live off SSE frames.
+function syncQr(){
+  $("qr-url").textContent = BCAST.url || "—";
+  $("qr-open").href = BCAST.url || "/listen";
+  const hint=$("qr-hint");
+  if(BCAST.lan){ hint.textContent="on the same Wi-Fi · tap GO LIVE on the phone"; hint.classList.remove("warn"); }
+  else { hint.textContent="restart with --lan so phones on the Wi-Fi can join"; hint.classList.add("warn"); }
+  if(!qrLoaded){ $("qr-img").src="/listen.qr.svg"; qrLoaded=true; }
+}
+function toggleQr(){
+  const pop=$("qr-pop");
+  if(pop.hidden){ syncQr(); pop.hidden=false; }
+  else pop.hidden=true;
+}
+function copyListen(){
+  const b=$("qr-copy"), url=BCAST.url||location.origin+"/listen";
+  const done=()=>{ const o=b.textContent; b.textContent="COPIED ✓"; b.classList.add("done");
+    setTimeout(()=>{ b.textContent=o; b.classList.remove("done"); }, 1500); };
+  if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(url).then(done).catch(done); }
+  else done();
+}
+// Click outside the popover closes it.
+document.addEventListener("click", ev=>{
+  const w=ev.target.closest(".bcast-wrap"), pop=$("qr-pop");
+  if(!w && pop && !pop.hidden) pop.hidden=true;
+});
 
 // ---- manual DJ queue ---------------------------------------------------
 // tid is id(track) as a string — sent back verbatim so the server matches by
